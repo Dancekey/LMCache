@@ -559,6 +559,34 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
     # appends. The scheduler role sets it from the vLLM config.
     _mamba_relocation_window: int = 0
 
+    def build_parallel_strategy(
+        self, vllm_config: "VllmConfig", n_servers: int
+    ) -> ParallelStrategy:
+        """Resolve cache geometry, retaining default multi-server PP rejection.
+
+        Device plugins may override this hook when they implement a supported
+        server-local PP layout. They must supply matching writer, reader and
+        piece identities to both scheduler and worker adapters.
+
+        Args:
+            vllm_config: Serving engine configuration.
+            n_servers: Number of cache endpoints.
+
+        Returns:
+            Geometry used by the scheduler and workers.
+
+        Raises:
+            ValueError: The default strategy cannot serve multi-server PP.
+        """
+        pp_size = vllm_config.parallel_config.pipeline_parallel_size
+        if n_servers > 1 and pp_size > 1:
+            raise ValueError(
+                "LMCacheMPConnector multi-server mode only supports "
+                "tensor parallelism (TP), not pipeline parallelism (PP). "
+                f"Got pp_size={pp_size}."
+            )
+        return build_parallel_strategy_from_vllm_config(vllm_config, n_servers)
+
     def __init__(
         self,
         vllm_config: "VllmConfig",
@@ -687,24 +715,8 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
                 "supported in a follow-up PR."
             )
 
-        # Multi-server + MLA: only TP is supported (no PP).
-        # PP splits layers across nodes, which would cause per-piece
-        # reader counts to vary per (server, pp_stage) pair and break
-        # the single-``tp_size`` LOOKUP / FREE_LOOKUP_LOCKS protocol.
-        # Non-MLA mode is not affected by this restriction.
-        if n_servers > 1:
-            pp_size = vllm_config.parallel_config.pipeline_parallel_size
-            if pp_size > 1:
-                raise ValueError(
-                    "LMCacheMPConnector multi-server mode only supports "
-                    "tensor parallelism (TP), not pipeline parallelism (PP). "
-                    f"Got pp_size={pp_size}."
-                )
-
+        parallel_strategy = self.build_parallel_strategy(vllm_config, n_servers)
         zmq_context = zmq.Context.instance()
-        parallel_strategy = build_parallel_strategy_from_vllm_config(
-            vllm_config, n_servers
-        )
 
         self.dispatcher = None
 
@@ -1696,6 +1708,13 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
 
         for new_request in scheduler_output.scheduled_new_reqs:
             request_tracker = self._get_request_tracker(new_request.req_id)
+
+            # MultiConnector may pass empty blocks to a non-selected loader,
+            # but a writer still needs the scheduler's allocated block ids.
+            if not request_tracker.allocated_block_ids and new_request.block_ids:
+                request_tracker.append_block_ids(
+                    new_request.block_ids, self._mamba_relocation_window
+                )
 
             num_new_tokens = scheduler_output.num_scheduled_tokens[new_request.req_id]
             request_tracker.increase_num_scheduled_tokens(num_new_tokens)
