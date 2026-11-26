@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Any
 from urllib.parse import urlsplit, urlunsplit
 import math
 import sys
+from threading import Event
 import time
 
 # Third Party
@@ -1752,6 +1753,11 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         events = self._kv_cache_events
         self._kv_cache_events = []
         return events
+
+    def set_pp_lookup_wakeup(self, wakeup: Event) -> bool:
+        """Notify the engine owner of lookup progress without consuming replies."""
+        self.scheduler_adapter.set_lookup_wakeup(wakeup)
+        return True
 
     def has_pending_push_work(self) -> bool:
         """Return whether vLLM should keep stepping for pending push work.

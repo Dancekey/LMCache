@@ -792,6 +792,7 @@ class LMCacheMPSchedulerAdapter:
         # - _per_server_hits: {request_id: {server_url: hit_chunks}}.
         #   Per-server hit counts, used to detect disagreement and free tail locks.
         self._pending_lookups: set[str] = set()
+        self._lookup_wakeup: threading.Event | None = None
         self._unacked_lookups: dict[str, _LookupAck] = {}
         self._finished_lookup_results: dict[str, int] = {}
         self._per_server_hits: dict[str, dict[str, int]] = {}
@@ -1049,7 +1050,19 @@ class LMCacheMPSchedulerAdapter:
         )
         self._pending_lookups.add(request_id)
         self._lookup_params[request_id] = (token_ids, cache_salt, request_configs)
+        if getattr(self, "_lookup_wakeup", None) is not None:
+            for future in futures.values():
+                self._watch_lookup_future(future)
         return True
+
+    def set_lookup_wakeup(self, wakeup: threading.Event) -> None:
+        """Register the engine's progress event before serving requests."""
+        self._lookup_wakeup = wakeup
+
+    def _watch_lookup_future(self, future: MessagingFuture[Any]) -> None:
+        wakeup = getattr(self, "_lookup_wakeup", None)
+        if wakeup is not None:
+            future.add_done_callback(lambda _: wakeup.set())
 
     def _free_inconsistent_lookup_locks(
         self,
@@ -1181,10 +1194,10 @@ class LMCacheMPSchedulerAdapter:
                     # The local lookup budget expired before sending STATUS.
                     # No outstanding RPC here establishes server failure.
                     return 0
-                futures[url] = (
-                    self.req_clients[url].query_prefetch_status(request_id),
-                    time.monotonic(),
-                )
+                future = self.req_clients[url].query_prefetch_status(request_id)
+                futures[url] = (future, time.monotonic())
+                if getattr(self, "_lookup_wakeup", None) is not None:
+                    self._watch_lookup_future(future)
 
         for url, (fut, submitted_at) in list(futures.items()):
             if self._nonblocking_lookup_status and not fut.query():

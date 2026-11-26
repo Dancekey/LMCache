@@ -452,6 +452,10 @@ class LMCacheMPConnectorMetadata(KVConnectorMetadata):
     def __len__(self):
         return len(self.requests)
 
+    def is_idle_pp_step(self) -> bool:
+        """Return whether this payload carries any worker-side KV operation."""
+        return not (self.requests or self.need_flush_before_forward or self.delay_free_req_ids)
+
     # For debugging
     def __str__(self):
         request_strs = []
