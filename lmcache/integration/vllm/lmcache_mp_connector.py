@@ -744,6 +744,14 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
             )
             or os.environ.get("AGY_MP_IN_STEP_RETRIEVE") == "1"
         )
+        self._mla_tp_broadcast_retrieve: bool = (
+            bool(
+                vllm_config.kv_transfer_config.get_from_extra_config(
+                    "lmcache.mp.mla_tp_broadcast_retrieve", False
+                )
+            )
+            or os.environ.get("AGY_MLA_TP_BROADCAST_RETRIEVE") == "1"
+        )
         self._pp_rank: int = (
             vllm_config.parallel_config.rank
             // max(1, vllm_config.parallel_config.tensor_parallel_size)
@@ -1076,6 +1084,13 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
             return
 
         sync_retrieve = getattr(self, "_in_step_sync_retrieve", False)
+        mla_bcast = (
+            sync_retrieve
+            and getattr(self, "_mla_tp_broadcast_retrieve", False)
+            and self.worker_adapter.parallel_strategy.mla_only
+            and self.worker_adapter.parallel_strategy.tp_size > 1
+            and self.worker_adapter.parallel_strategy.dcp_size == 1
+        )
         span_fn = getattr(self, "_trace_span", None)
         ctx = (
             span_fn(
@@ -1083,23 +1098,112 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
                 pp_rank=getattr(self, "_pp_rank", 0),
                 num_reqs=len(request_ids),
                 sync=sync_retrieve,
+                mla_bcast=mla_bcast,
             )
             if span_fn is not None
             else nullcontext()
         )
         with ctx:
-            event = self.worker_adapter.create_recorded_event()
-            submit_kwargs = (
-                {"sync_on_stream": True} if sync_retrieve else {}
+            if mla_bcast:
+                if self.worker_adapter.is_kv_writer:
+                    event = self.worker_adapter.create_recorded_event()
+                    self.worker_adapter.batched_submit_retrieve_requests(
+                        request_ids,
+                        ops,
+                        event,
+                        cache_salts=cache_salts,
+                        request_configs_list=request_configs_list,
+                        sync_on_stream=True,
+                    )
+                else:
+                    self.worker_adapter._ensure_heartbeat_started()
+                self._broadcast_retrieved_blocks_tp(ops)
+            else:
+                event = self.worker_adapter.create_recorded_event()
+                submit_kwargs = (
+                    {"sync_on_stream": True} if sync_retrieve else {}
+                )
+                self.worker_adapter.batched_submit_retrieve_requests(
+                    request_ids,
+                    ops,
+                    event,
+                    cache_salts=cache_salts,
+                    request_configs_list=request_configs_list,
+                    **submit_kwargs,
+                )
+
+    def _broadcast_retrieved_blocks_tp(self, ops: list[Any]) -> None:
+        from vllm.distributed import get_tp_group
+
+        leaves = getattr(self, "_cached_kv_leaves", None)
+        if leaves is None:
+            leaves = []
+
+            def _collect(v: Any) -> None:
+                if isinstance(v, torch.Tensor):
+                    leaves.append(v)
+                elif isinstance(v, (list, tuple)):
+                    for item in v:
+                        _collect(item)
+                elif isinstance(v, dict):
+                    for k in sorted(v.keys()):
+                        _collect(v[k])
+
+            kv_map = self.worker_adapter.kv_caches
+            for k in sorted(kv_map.keys()):
+                _collect(kv_map[k])
+            self._cached_kv_leaves = leaves
+
+        if not leaves:
+            return
+        bs = int(leaves[0].shape[1])
+        target_blocks: list[int] = []
+        for op in ops:
+            skip_blks = op.skip_first_n_tokens // bs
+            target_blocks.extend(op.flat_block_ids[skip_blks:])
+        unique_blocks = list(dict.fromkeys(target_blocks))
+        if not unique_blocks:
+            return
+
+        dev = leaves[0].device
+        per_block_bytes = [
+            int(t.shape[1:].numel()) * t.element_size() for t in leaves
+        ]
+        bytes_per_blk_total = sum(per_block_bytes)
+        tp_group = get_tp_group()
+        is_src = bool(self.worker_adapter.is_kv_writer)
+        chunk_sz = 64
+        for off in range(0, len(unique_blocks), chunk_sz):
+            blk_slice = unique_blocks[off : off + chunk_sz]
+            n_b = len(blk_slice)
+            idx = torch.tensor(blk_slice, dtype=torch.int64, device=dev)
+            buf = torch.empty(
+                (n_b * bytes_per_blk_total,), dtype=torch.uint8, device=dev
             )
-            self.worker_adapter.batched_submit_retrieve_requests(
-                request_ids,
-                ops,
-                event,
-                cache_salts=cache_salts,
-                request_configs_list=request_configs_list,
-                **submit_kwargs,
-            )
+            if is_src:
+                cursor = 0
+                for t, bbytes in zip(leaves, per_block_bytes):
+                    span = n_b * bbytes
+                    selected = (
+                        t.index_select(0, idx)
+                        .contiguous()
+                        .view(torch.uint8)
+                        .reshape(-1)
+                    )
+                    buf[cursor : cursor + span].copy_(selected)
+                    cursor += span
+            tp_group.broadcast(buf, src=0)
+            if not is_src:
+                cursor = 0
+                for t, bbytes in zip(leaves, per_block_bytes):
+                    span = n_b * bbytes
+                    part = (
+                        buf[cursor : cursor + span]
+                        .view(t.dtype)
+                        .reshape((n_b,) + tuple(t.shape[1:]))
+                    )
+                    t.index_copy_(0, idx, part)
+                    cursor += span
 
     def wait_for_layer_load(self, layer_name: str) -> None:
         """

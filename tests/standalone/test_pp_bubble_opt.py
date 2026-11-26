@@ -302,6 +302,167 @@ class PPBubbleOptTests(unittest.TestCase):
         self.assertEqual(fn(make_connector(False), req, 0), (256, True))
         self.assertEqual(fn(make_connector(True), req, 0), (256, False))
 
+    def test_mla_tp_broadcast_retrieve_packs_and_copies_strided_and_int8_planes(
+        self,
+    ) -> None:
+        import sys
+        import types
+        import torch
+
+        bcast_node = _extract_method(
+            CONNECTOR_PATH, "LMCacheMPConnector", "_broadcast_retrieved_blocks_tp"
+        )
+        load_node = _extract_method(
+            CONNECTOR_PATH, "LMCacheMPConnector", "start_load_kv"
+        )
+
+        # Simulate TP=2 broadcast from src=0 (writer) -> dst=1 (non-writer)
+        src_full = torch.randn((16, 4, 1, 12), dtype=torch.float32)
+        src_kvc = src_full[:, :, :, :8]
+        src_kpe = src_full[:, :, :, 8:]
+        src_li8 = torch.randint(-64, 64, (16, 4, 1, 6), dtype=torch.int8)
+
+        dst_full = torch.zeros_like(src_full)
+        dst_kvc = dst_full[:, :, :, :8]
+        dst_kpe = dst_full[:, :, :, 8:]
+        dst_li8 = torch.zeros_like(src_li8)
+
+        wire_buffers: list[torch.Tensor] = []
+
+        class FakeTPGroupWriter:
+            def broadcast(self, buf: torch.Tensor, src: int = 0) -> torch.Tensor:
+                self.last_src = src
+                wire_buffers.append(buf.clone())
+                return buf
+
+        class FakeTPGroupNonWriter:
+            def broadcast(self, buf: torch.Tensor, src: int = 0) -> torch.Tensor:
+                buf.copy_(wire_buffers.pop(0))
+                return buf
+
+        fake_vllm_dist = types.ModuleType("vllm.distributed")
+        saved_mods = {
+            k: sys.modules.get(k) for k in ("vllm", "vllm.distributed")
+        }
+        sys.modules["vllm"] = types.ModuleType("vllm")
+        sys.modules["vllm.distributed"] = fake_vllm_dist
+        try:
+            ns = {
+                "torch": torch,
+                "Any": object,
+                "LMCacheMPConnectorMetadata": SimpleNamespace,
+                "nullcontext": contextlib.nullcontext,
+            }
+            bcast_fn = _compile_method(bcast_node, ns)
+            load_fn = _compile_method(load_node, ns)
+
+            # skip_first_n_tokens=4 (bs=4 -> skip first 1 APC block id=1; broadcast blocks 3 and 7)
+            ops = [
+                SimpleNamespace(
+                    skip_first_n_tokens=4,
+                    flat_block_ids=[1, 3, 7],
+                ),
+                SimpleNamespace(
+                    skip_first_n_tokens=0,
+                    flat_block_ids=[7, 9],  # duplicate block 7 deduplicated!
+                ),
+            ]
+            meta = SimpleNamespace(
+                delay_free_req_ids=set(),
+                requests=[
+                    SimpleNamespace(
+                        direction="RETRIEVE",
+                        request_id="r1",
+                        op=ops[0],
+                        cache_salt="",
+                        request_configs=None,
+                    ),
+                    SimpleNamespace(
+                        direction="RETRIEVE",
+                        request_id="r2",
+                        op=ops[1],
+                        cache_salt="",
+                        request_configs=None,
+                    ),
+                ],
+            )
+
+            writer_submits: list[tuple] = []
+            fake_vllm_dist.get_tp_group = lambda: FakeTPGroupWriter()
+            writer_conn = SimpleNamespace(
+                _get_connector_metadata=lambda: meta,
+                _delay_free_req_ids=set(),
+                _in_step_sync_retrieve=True,
+                _mla_tp_broadcast_retrieve=True,
+                _pp_rank=0,
+                _trace_span=None,
+                worker_adapter=SimpleNamespace(
+                    is_kv_writer=True,
+                    kv_caches={"l0": (src_kvc, src_kpe), "l1_idx": [src_li8]},
+                    parallel_strategy=SimpleNamespace(
+                        mla_only=True, tp_size=16, dcp_size=1
+                    ),
+                    create_recorded_event=lambda: "ev0",
+                    batched_submit_retrieve_requests=lambda *a, **kw: writer_submits.append(
+                        (a, kw)
+                    ),
+                    _ensure_heartbeat_started=lambda: None,
+                ),
+            )
+            writer_conn._broadcast_retrieved_blocks_tp = (
+                lambda o: bcast_fn(writer_conn, o)
+            )
+            load_fn(writer_conn, None)
+            self.assertEqual(len(writer_submits), 1)
+            self.assertEqual(writer_submits[0][1], {
+                "cache_salts": ["", ""],
+                "request_configs_list": [None, None],
+                "sync_on_stream": True,
+            })
+            self.assertEqual(len(wire_buffers), 1)
+
+            nonwriter_submits: list[tuple] = []
+            hb_called: list[bool] = []
+            fake_vllm_dist.get_tp_group = lambda: FakeTPGroupNonWriter()
+            nonwriter_conn = SimpleNamespace(
+                _get_connector_metadata=lambda: meta,
+                _delay_free_req_ids=set(),
+                _in_step_sync_retrieve=True,
+                _mla_tp_broadcast_retrieve=True,
+                _pp_rank=0,
+                _trace_span=None,
+                worker_adapter=SimpleNamespace(
+                    is_kv_writer=False,
+                    kv_caches={"l0": (dst_kvc, dst_kpe), "l1_idx": [dst_li8]},
+                    parallel_strategy=SimpleNamespace(
+                        mla_only=True, tp_size=16, dcp_size=1
+                    ),
+                    create_recorded_event=lambda: "ev1",
+                    batched_submit_retrieve_requests=lambda *a, **kw: nonwriter_submits.append(
+                        (a, kw)
+                    ),
+                    _ensure_heartbeat_started=lambda: hb_called.append(True),
+                ),
+            )
+            nonwriter_conn._broadcast_retrieved_blocks_tp = (
+                lambda o: bcast_fn(nonwriter_conn, o)
+            )
+            load_fn(nonwriter_conn, None)
+
+            # Non-writer sends ZERO server retrieve RPCs, starts heartbeat, and receives exact blocks [3, 7, 9]!
+            self.assertEqual(nonwriter_submits, [])
+            self.assertEqual(hb_called, [True])
+            self.assertTrue(torch.equal(dst_full[[3, 7, 9]], src_full[[3, 7, 9]]))
+            self.assertTrue(torch.equal(dst_li8[[3, 7, 9]], src_li8[[3, 7, 9]]))
+            # Skipped APC block 1 untouched on dst!
+            self.assertEqual(float(dst_full[1].abs().sum()), 0.0)
+        finally:
+            for k, v in saved_mods.items():
+                if v is None:
+                    sys.modules.pop(k, None)
+                else:
+                    sys.modules[k] = v
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
