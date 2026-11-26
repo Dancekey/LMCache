@@ -3,8 +3,10 @@
 # Standard
 from collections.abc import Iterable
 from typing import TYPE_CHECKING, Any
+from contextlib import nullcontext
 from urllib.parse import urlsplit, urlunsplit
 import math
+import os
 import sys
 from threading import Event
 import time
@@ -86,6 +88,7 @@ from lmcache.integration.vllm.utils import (
 )
 from lmcache.utils import CacheRemoveEvent
 from lmcache.utils import init_logger as lmcache_init_logger
+from lmcache.v1.multiprocess.pp_bubble_trace import trace_span as _pp_trace_span
 from lmcache.v1.multiprocess.pp_layout import PPStageLocator
 
 try:
@@ -733,6 +736,19 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
                 "lmcache.mp.eager_prefetch", False
             )
         )
+        self._in_step_sync_retrieve: bool = (
+            bool(
+                vllm_config.kv_transfer_config.get_from_extra_config(
+                    "lmcache.mp.in_step_sync_retrieve", False
+                )
+            )
+            or os.environ.get("AGY_MP_IN_STEP_RETRIEVE") == "1"
+        )
+        self._pp_rank: int = (
+            vllm_config.parallel_config.rank
+            // max(1, vllm_config.parallel_config.tensor_parallel_size)
+        )
+        self._trace_span = _pp_trace_span
 
         # Multi-server: prefer lmcache.mp.server_urls (list or comma-separated
         # string) over the single-server lmcache.mp.host / lmcache.mp.port.
@@ -1059,15 +1075,31 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         if len(request_ids) == 0:
             return
 
-        event = self.worker_adapter.create_recorded_event()
-
-        self.worker_adapter.batched_submit_retrieve_requests(
-            request_ids,
-            ops,
-            event,
-            cache_salts=cache_salts,
-            request_configs_list=request_configs_list,
+        sync_retrieve = getattr(self, "_in_step_sync_retrieve", False)
+        span_fn = getattr(self, "_trace_span", None)
+        ctx = (
+            span_fn(
+                "worker.start_load_kv",
+                pp_rank=getattr(self, "_pp_rank", 0),
+                num_reqs=len(request_ids),
+                sync=sync_retrieve,
+            )
+            if span_fn is not None
+            else nullcontext()
         )
+        with ctx:
+            event = self.worker_adapter.create_recorded_event()
+            submit_kwargs = (
+                {"sync_on_stream": True} if sync_retrieve else {}
+            )
+            self.worker_adapter.batched_submit_retrieve_requests(
+                request_ids,
+                ops,
+                event,
+                cache_salts=cache_salts,
+                request_configs_list=request_configs_list,
+                **submit_kwargs,
+            )
 
     def wait_for_layer_load(self, layer_name: str) -> None:
         """
@@ -1140,17 +1172,28 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
                 dispatch(self.dispatcher, "wait_for_save", event=None)
             return
 
-        event = self.worker_adapter.create_recorded_event(for_store=True)
-
-        self.worker_adapter.batched_submit_store_requests(
-            request_ids,
-            ops,
-            event,
-            cache_salts=cache_salts,
-            request_configs_list=request_configs_list,
+        span_fn = getattr(self, "_trace_span", None)
+        ctx = (
+            span_fn(
+                "worker.wait_for_save",
+                pp_rank=getattr(self, "_pp_rank", 0),
+                num_reqs=len(request_ids),
+            )
+            if span_fn is not None
+            else nullcontext()
         )
-        if self.dispatcher is not None:
-            dispatch(self.dispatcher, "wait_for_save", event=event)
+        with ctx:
+            event = self.worker_adapter.create_recorded_event(for_store=True)
+
+            self.worker_adapter.batched_submit_store_requests(
+                request_ids,
+                ops,
+                event,
+                cache_salts=cache_salts,
+                request_configs_list=request_configs_list,
+            )
+            if self.dispatcher is not None:
+                dispatch(self.dispatcher, "wait_for_save", event=event)
 
     # TODO: How does lmcache driven path handle preemption?
     # NOTE1: handle_preemptions is called by vllm each step regardless
@@ -1495,6 +1538,8 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         logger.debug(
             "vLLM hit is: %d, Need to load is %d", num_computed_tokens, need_to_load
         )
+        if getattr(self, "_in_step_sync_retrieve", False) and need_to_load > 0:
+            return need_to_load, False
         return need_to_load, need_to_load > 0
 
     def on_new_request(self, request: "Request") -> None:

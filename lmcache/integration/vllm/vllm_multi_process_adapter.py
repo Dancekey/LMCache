@@ -144,6 +144,10 @@ class ExtraConfigDefault(enum.Enum):
     pp_query_fastpath = False
     # Per-client ZMQ send budget per polling turn; zero drains unlimited frames.
     pp_control_outbound_budget = 0
+    # Execute LMCache MP KV retrieve synchronously on the worker stream inside
+    # start_load_kv (load_kv_async=False) instead of parking requests in a
+    # 2-step WAITING_FOR_REMOTE_KVS barrier across PP batch_queue steps.
+    in_step_sync_retrieve = False
     # Routing mode for ``create_transfer_context``: ``auto`` resolves to
     # the device spec's declared default (derived from
     # ``is_lmcache_driven_available()``: CUDA and NPU -> lmcache_driven;
@@ -1674,6 +1678,7 @@ class LMCacheMPWorkerAdapter:
         # event object to stay alive until the consumer is done with it.
         self.store_events: dict[str, _IpcEvent] = {}
         self.retrieve_events: dict[str, _IpcEvent] = {}
+        self._sync_retrieve_inflight: list[tuple[MessagingFuture[Any], _IpcEvent | None]] = []
 
         # Alternative error reports, drained together by either public getter.
         self.error_block_ids: set[int] = set()
@@ -1917,7 +1922,10 @@ class LMCacheMPWorkerAdapter:
             os.environ.get("KS_STORE_ASYNC_EXPORT") == "1"
             and self.parallel_strategy.pp_stage_local
             and self.is_kv_writer
-            and self.parallel_strategy.vllm_worker_id == 16
+            and (
+                self.parallel_strategy.vllm_worker_id == 16
+                or os.environ.get("AGY_PP0_ASYNC_EXPORT", "1") == "1"
+            )
             and isinstance(transfer_ctx, LMCacheDrivenTransferContext)
         ):
             if getattr(self, "_ks_store_exports", None) is None:
@@ -2325,6 +2333,8 @@ class LMCacheMPWorkerAdapter:
         event: _IpcEvent | None,
         cache_salts: list[str] | None = None,
         request_configs_list: list[dict[str, Any] | None] | None = None,
+        *,
+        sync_on_stream: bool = False,
     ):
         """
         Submit a batched retrieve request to LMCache
@@ -2340,6 +2350,9 @@ class LMCacheMPWorkerAdapter:
                 request_ids.
             request_configs_list: Optional LMCache request configs, one per
                 request.
+            sync_on_stream: When True, order H2D completion on the current
+                device stream immediately without registering async
+                ``finished_recving`` notifications.
         """
         if cache_salts is None:
             cache_salts = [""] * len(request_ids)
@@ -2355,16 +2368,69 @@ class LMCacheMPWorkerAdapter:
                 "request_ids, ops, cache_salts, and request_configs_list "
                 "must have the same length"
             )
+        if not sync_on_stream:
+            for request_id, op, salt, request_configs in zip(
+                request_ids, ops, cache_salts, request_configs_list, strict=True
+            ):
+                self.submit_retrieve_request(
+                    request_id,
+                    op,
+                    event,
+                    cache_salt=salt,
+                    request_configs=request_configs,
+                )
+            return
+
+        self._ensure_heartbeat_started()
+        if not self.is_healthy:
+            for request_id, op in zip(request_ids, ops, strict=True):
+                self.error_block_ids.update(op.flat_block_ids)
+                self._failed_request_ids.add(request_id)
+            return
+        if self.transfer_ctx is None:
+            raise RuntimeError(
+                "Transfer context is not initialized. "
+                "Call register_kv_caches() before submitting retrieve requests."
+            )
+
+        submitted: list[tuple[str, MessagingFuture[RetrieveResult], list[int]]] = []
         for request_id, op, salt, request_configs in zip(
             request_ids, ops, cache_salts, request_configs_list, strict=True
         ):
-            self.submit_retrieve_request(
-                request_id,
-                op,
-                event,
+            assert op.token_ids is not None
+            key = self._create_key(
+                op.token_ids,
+                op.start,
+                op.end,
+                request_id=request_id,
                 cache_salt=salt,
                 request_configs=request_configs,
             )
+            future = self.transfer_ctx.submit_retrieve(
+                request_id,
+                key,
+                self.kv_caches,
+                self._block_ids_per_group(op),
+                event,
+                self.blocks_in_chunk,
+                skip_first_n_tokens=op.skip_first_n_tokens,
+            )
+            submitted.append((request_id, future, op.flat_block_ids))
+
+        stream = torch_dev.current_stream()
+        for request_id, future, flat_block_ids in submitted:
+            try:
+                ok = future.wait_on_stream(stream, timeout=self._mq_timeout)
+            except Exception:
+                logger.exception(
+                    "In-step stream retrieve failed for request_id=%s", request_id
+                )
+                ok = False
+            if not ok:
+                self.error_block_ids.update(flat_block_ids)
+                self._failed_request_ids.add(request_id)
+            else:
+                self._sync_retrieve_inflight.append((future, event))
 
     def _process_finished_stores(
         self,
@@ -2457,6 +2523,18 @@ class LMCacheMPWorkerAdapter:
         """
         if self.dispatcher is not None:
             dispatch(self.dispatcher, "reclaim")
+
+        sync_inflight = getattr(self, "_sync_retrieve_inflight", None)
+        if sync_inflight:
+            still_inflight = []
+            for sync_fut, sync_ev in sync_inflight:
+                try:
+                    settled = sync_fut.query()
+                except Exception:
+                    settled = True
+                if not settled:
+                    still_inflight.append((sync_fut, sync_ev))
+            self._sync_retrieve_inflight = still_inflight
 
         healthy = self.is_healthy
         strict_transfers = get_read_policy() == "transfer_borrow"
@@ -2609,6 +2687,18 @@ class LMCacheMPWorkerAdapter:
 
         if self.dispatcher is not None:
             dispatch(self.dispatcher, "reclaim")
+
+        sync_inflight = getattr(self, "_sync_retrieve_inflight", None)
+        if sync_inflight:
+            still_inflight = []
+            for sync_fut, sync_ev in sync_inflight:
+                try:
+                    settled = sync_fut.query()
+                except Exception:
+                    settled = True
+                if not settled:
+                    still_inflight.append((sync_fut, sync_ev))
+            self._sync_retrieve_inflight = still_inflight
 
         healthy = self.is_healthy
         strict_transfers = get_read_policy() == "transfer_borrow"
