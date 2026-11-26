@@ -31,6 +31,7 @@ def create_request_client(
     server_url: str,
     *,
     context: Any | None = None,
+    outbound_batch_limit: int = 0,
 ) -> RequestClient:
     """Create a method-oriented request client backed by ZMQ.
 
@@ -53,7 +54,9 @@ def create_request_client(
     if context is None:
         context = zmq.Context.instance()
     return ZmqMultiprocessClient(  # type: ignore[abstract]
-        MessageQueueClient(server_url, context)
+        MessageQueueClient(
+            server_url, context, outbound_batch_limit=outbound_batch_limit
+        )
     )
 
 

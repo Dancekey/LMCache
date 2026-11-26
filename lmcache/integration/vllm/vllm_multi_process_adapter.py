@@ -139,6 +139,8 @@ class ExtraConfigDefault(enum.Enum):
     nonblocking_lookup_status = True
     # Stage-local PP lookup fastpath (inline lookup reply & zero short-circuit).
     pp_query_fastpath = False
+    # Per-client ZMQ send budget per polling turn; zero drains unlimited frames.
+    pp_control_outbound_budget = 0
     # Routing mode for ``create_transfer_context``: ``auto`` resolves to
     # the device spec's declared default (derived from
     # ``is_lmcache_driven_available()``: CUDA and NPU -> lmcache_driven;
@@ -740,14 +742,11 @@ class LMCacheMPSchedulerAdapter:
         )
         assert len(server_urls) >= 1, "At least one server url required"
         self._server_urls: list[str] = list(server_urls)
-        self.req_clients: dict[str, RequestClient] = {
-            url: RequestClientFactory.create(url, context=context)
-            for url in self._server_urls
-        }
         self._nonblocking_lookup_status = (
             ExtraConfigDefault.nonblocking_lookup_status.default
         )
         self._pp_query_fastpath = ExtraConfigDefault.pp_query_fastpath.default
+        outbound_budget = ExtraConfigDefault.pp_control_outbound_budget.default
         if extra_config is not None:
             cfg = _resolve_extra_config(extra_config)
             mq_timeout = cfg[ExtraConfigDefault.mq_timeout.name]
@@ -756,6 +755,15 @@ class LMCacheMPSchedulerAdapter:
                 ExtraConfigDefault.nonblocking_lookup_status.name
             ]
             self._pp_query_fastpath = cfg[ExtraConfigDefault.pp_query_fastpath.name]
+            outbound_budget = cfg[ExtraConfigDefault.pp_control_outbound_budget.name]
+        if outbound_budget < 0:
+            raise ValueError("pp_control_outbound_budget must be nonnegative")
+        self.req_clients: dict[str, RequestClient] = {
+            url: RequestClientFactory.create(
+                url, context=context, outbound_batch_limit=outbound_budget
+            )
+            for url in self._server_urls
+        }
         if self._pp_query_fastpath and not (
             parallel_strategy.pp_stage_local
             and parallel_strategy.pp_size > 1
@@ -1568,6 +1576,7 @@ class LMCacheMPWorkerAdapter:
             legacy_block_size,
             mq_timeout,
         )
+        outbound_budget = ExtraConfigDefault.pp_control_outbound_budget.default
         self._mp_server_launcher = None
         hash_algorithm = ExtraConfigDefault.hash_algorithm.default
         if extra_config is not None:
@@ -1589,6 +1598,7 @@ class LMCacheMPWorkerAdapter:
                     zmq_context=context,
                 )
             cfg = _resolve_extra_config(extra_config)
+            outbound_budget = cfg[ExtraConfigDefault.pp_control_outbound_budget.name]
             mq_timeout = cfg[ExtraConfigDefault.mq_timeout.name]
             heartbeat_interval = cfg[ExtraConfigDefault.heartbeat_interval.name]
             hash_algorithm = cfg[ExtraConfigDefault.hash_algorithm.name]
@@ -1609,7 +1619,11 @@ class LMCacheMPWorkerAdapter:
             )
         else:
             self._mp_transfer_mode = None
-        self.req_client = RequestClientFactory.create(server_url, context=context)
+        if outbound_budget < 0:
+            raise ValueError("pp_control_outbound_budget must be nonnegative")
+        self.req_client = RequestClientFactory.create(
+            server_url, context=context, outbound_batch_limit=outbound_budget
+        )
         self._mq_timeout = mq_timeout
 
         # Instance id for GPU worker. uuid4-derived (OS entropy) rather

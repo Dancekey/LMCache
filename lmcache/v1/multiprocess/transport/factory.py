@@ -33,6 +33,7 @@ class RequestClientFactory:
         server_url: str,
         *,
         context: Any | None = None,
+        outbound_batch_limit: int = 0,
     ) -> RequestClient:
         """Create a request client selected by ``server_url`` scheme.
 
@@ -53,6 +54,8 @@ class RequestClientFactory:
             ValueError: If the URL is empty, malformed, or uses an unsupported
                 scheme.
         """
+        if outbound_batch_limit < 0:
+            raise ValueError("outbound_batch_limit must be nonnegative")
         scheme, normalized_url = _normalize_server_url(server_url)
         if scheme in _ZMQ_SCHEMES:
             # First Party
@@ -61,8 +64,11 @@ class RequestClientFactory:
             return zmq_impl.create_request_client(
                 normalized_url,
                 context=context,
+                outbound_batch_limit=outbound_batch_limit,
             )
         if scheme in _GRPC_SCHEMES:
+            if outbound_batch_limit:
+                raise ValueError("outbound_batch_limit is only supported by ZMQ")
             # First Party
             from lmcache.v1.multiprocess.transport import grpc_impl
 
