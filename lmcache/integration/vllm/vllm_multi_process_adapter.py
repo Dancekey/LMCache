@@ -1138,6 +1138,9 @@ class LMCacheMPSchedulerAdapter:
                         del ack.futures[url]
                         if hits is not None:
                             per_server[url] = int(hits)
+                            if hits == 0:
+                                self._finished_lookup_results[request_id] = 0
+                                return 0
             else:
                 ack.futures = {
                     url: fut for url, fut in ack.futures.items() if not fut.query()
@@ -1202,6 +1205,11 @@ class LMCacheMPSchedulerAdapter:
                     return 0
                 continue
             per_server[url] = int(r)
+            if self._pp_query_fastpath and type(r) is int and r == 0:
+                # The common prefix across stages is empty regardless of peers.
+                # Outstanding peer controls remain owned until normal session end.
+                self._finished_lookup_results[request_id] = 0
+                return 0
 
         if len(per_server) < len(self._server_urls):
             return None
