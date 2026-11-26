@@ -2091,6 +2091,8 @@ class LMCacheMPWorkerAdapter:
         event: _IpcEvent | None,
         cache_salt: str = "",
         request_configs: dict[str, Any] | None = None,
+        *,
+        _pruned_store_context: LMCacheDrivenTransferContext | None = None,
     ):
         """
         Submit a KV cache store request to LMCache
@@ -2109,6 +2111,7 @@ class LMCacheMPWorkerAdapter:
             cache_salt: Per-user isolation salt.
             request_configs: Optional LMCache request configs to include in
                 the IPC key.
+            _pruned_store_context: The context already pruned for this batch.
         """
         self._ensure_heartbeat_started()
 
@@ -2141,12 +2144,13 @@ class LMCacheMPWorkerAdapter:
             request_configs=request_configs,
         )
         _ks_store_probe.mark(1)
-        if self.transfer_ctx is None:
+        transfer_ctx = self.transfer_ctx
+        if transfer_ctx is None:
             raise RuntimeError(
                 "Transfer context is not initialized. "
                 "Call register_kv_caches() before submitting store requests."
             )
-        future = self.transfer_ctx.submit_store(
+        store_args = (
             request_id,
             key,
             self.kv_caches,
@@ -2154,6 +2158,15 @@ class LMCacheMPWorkerAdapter:
             event,
             self.blocks_in_chunk,
         )
+        if (
+            _pruned_store_context is not None
+            and transfer_ctx is _pruned_store_context
+        ):
+            future = _pruned_store_context.submit_store(
+                *store_args, prune_inflight=False
+            )
+        else:
+            future = transfer_ctx.submit_store(*store_args)
         _ks_store_probe.mark(7)
         self.store_futures[request_id] = future
         if event is not None:
@@ -2268,6 +2281,17 @@ class LMCacheMPWorkerAdapter:
                 "request_ids, ops, cache_salts, and request_configs_list "
                 "must have the same length"
             )
+        store_options = {}
+        transfer_ctx = self.transfer_ctx
+        if (
+            len(request_ids) > 1
+            and self.is_kv_writer
+            and self.parallel_strategy.pp_stage_local
+            and self.parallel_strategy.vllm_worker_id == 0
+            and isinstance(transfer_ctx, LMCacheDrivenTransferContext)
+        ):
+            transfer_ctx.prune_settled_stores()
+            store_options["_pruned_store_context"] = transfer_ctx
         for request_id, op, salt, request_configs in zip(
             request_ids, ops, cache_salts, request_configs_list, strict=True
         ):
@@ -2277,6 +2301,7 @@ class LMCacheMPWorkerAdapter:
                 event,
                 cache_salt=salt,
                 request_configs=request_configs,
+                **store_options,
             )
 
     @_lmcache_nvtx_annotate

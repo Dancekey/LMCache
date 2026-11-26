@@ -657,6 +657,8 @@ class LMCacheDrivenTransferContext(TransferContext):
         block_ids: list[list[int]],
         event: IPCEvent | None,
         _blocks_in_chunk: int,
+        *,
+        prune_inflight: bool = True,
     ) -> MessagingFuture:
         """Submit a handle-based store ordered by ``event``.
 
@@ -668,6 +670,8 @@ class LMCacheDrivenTransferContext(TransferContext):
             block_ids: Engine block IDs indexed by LMCache KV group.
             event: Producer event that orders reads of the engine KV cache.
             _blocks_in_chunk: Engine blocks per chunk (unused by this transport).
+            prune_inflight: Prune completed stores before tracking this one.
+                A caller that already pruned for the batch can skip this scan.
 
         Returns:
             A device-event-aware future for the server response.
@@ -700,12 +704,21 @@ class LMCacheDrivenTransferContext(TransferContext):
         )
         _ks_store_probe.mark(5)
         with self._inflight_lock:
-            self._inflight_stores = [
-                f for f in self._inflight_stores if not self._store_settled(f)
-            ]
+            if prune_inflight:
+                self._prune_settled_stores_locked()
             self._inflight_stores.append(future)
         _ks_store_probe.mark(6)
         return future
+
+    def prune_settled_stores(self) -> None:
+        """Drop settled futures before submitting a batch of stores."""
+        with self._inflight_lock:
+            self._prune_settled_stores_locked()
+
+    def _prune_settled_stores_locked(self) -> None:
+        self._inflight_stores = [
+            f for f in self._inflight_stores if not self._store_settled(f)
+        ]
 
     def submit_q_store(
         self,
