@@ -42,6 +42,10 @@ from lmcache.v1.multiprocess.object_group_transfer import (
     downsample_and_stage_block_ids,
     transfer_kv_per_object_group,
 )
+from lmcache.v1.multiprocess.pp_bubble_trace import (
+    emit_span as _emit_bubble_span,
+    is_enabled as _bubble_trace_enabled,
+)
 from lmcache.v1.multiprocess.pp_layout import (
     PPRegistrationAck,
     PPRegistrationInfo,
@@ -282,7 +286,24 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
             "release_read_borrow", self._release_read_borrow,
             payload_type=tuple[str, int],
         )
+        self._device_host_func_dispatcher.register(
+            "agy_trace_done", self._on_trace_transfer_done,
+            payload_type=tuple[str, str, int, int],
+        )
+        self._bubble_trace_enabled = _bubble_trace_enabled()
         self._device_host_func_dispatcher.start()
+
+    def _on_trace_transfer_done(
+        self, payload: tuple[str, str, int, int]
+    ) -> None:
+        event_name, request_id, start_ns, num_tokens = payload
+        _emit_bubble_span(
+            event_name,
+            start_ns,
+            time.monotonic_ns(),
+            request_id=request_id,
+            num_tokens=num_tokens,
+        )
 
     def _release_read_borrow(self, payload: tuple[str, int]) -> None:
         self._ctx.storage_manager.release_borrow(ReadBorrowToken(*payload))
@@ -867,6 +888,11 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
             reference those buffers.
         """
         st = time.perf_counter()
+        trace_start_ns = (
+            time.monotonic_ns()
+            if getattr(self, "_bubble_trace_enabled", False)
+            else 0
+        )
 
         entry = self.get_and_touch_context_entry(instance_id)
         if entry is None:
@@ -1067,6 +1093,12 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                 else:
                     total_bytes = 0
                 num_tokens = num_chunks * self._ctx.chunk_size if stored_count else 0
+                if trace_start_ns and stored_count:
+                    submit_callback_to_stream(
+                        cache_context.cupy_stream,
+                        "agy_trace_done",
+                        ("mp_server.store", key.request_id, trace_start_ns, num_tokens),
+                    )
                 self._ctx.event_bus.publish_on_stream(
                     cache_context.cupy_stream,
                     Event(
@@ -1145,6 +1177,11 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                 key, instance_id, gpu_block_ids, event_ipc_handle, skip_first_n_tokens
             )
         st = time.perf_counter()
+        trace_start_ns = (
+            time.monotonic_ns()
+            if getattr(self, "_bubble_trace_enabled", False)
+            else 0
+        )
 
         entry = self.get_and_touch_context_entry(instance_id)
         if entry is None:
@@ -1336,6 +1373,12 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                     if len(prefetched_keys) == expected_retained
                     else 0
                 )
+                if trace_start_ns and retrieve_succeeded:
+                    submit_callback_to_stream(
+                        cache_context.cupy_stream,
+                        "agy_trace_done",
+                        ("mp_server.retrieve", key.request_id, trace_start_ns, num_tokens),
+                    )
                 self._ctx.event_bus.publish_on_stream(
                     cache_context.cupy_stream,
                     Event(
@@ -1410,6 +1453,11 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
         token_payload = (borrow.token.server_instance_id, borrow.token.sequence)
         total_bytes = sum(obj.get_size() for obj in borrow.objects.values())
         transfer_key = next_transfer_key(key.request_id)
+        trace_start_ns = (
+            time.monotonic_ns()
+            if getattr(self, "_bubble_trace_enabled", False)
+            else 0
+        )
         submitted = False
         try:
             with torch_dev.device(context.device), torch_dev.stream(context.stream):
@@ -1453,6 +1501,17 @@ class LMCacheDrivenTransferModule(InstanceLivenessTarget):
                     succeeded = False
                 backend.record_event(event, context.stream)
                 submit_callback_to_stream(context.cupy_stream, "release_read_borrow", token_payload)
+                if trace_start_ns and succeeded:
+                    submit_callback_to_stream(
+                        context.cupy_stream,
+                        "agy_trace_done",
+                        (
+                            "mp_server.retrieve",
+                            key.request_id,
+                            trace_start_ns,
+                            num_chunks * self._ctx.chunk_size,
+                        ),
+                    )
                 self._ctx.event_bus.publish_on_stream(context.cupy_stream, Event(
                     event_type=EventType.MP_RETRIEVE_END, session_id=key.request_id,
                     metadata={"retrieved_count": len(retained) if succeeded else 0,

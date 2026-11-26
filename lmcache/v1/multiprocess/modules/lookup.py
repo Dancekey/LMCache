@@ -26,6 +26,10 @@ from lmcache.v1.multiprocess.custom_types import IPCCacheServerKey
 from lmcache.v1.multiprocess.engine_context import MPCacheServerContext
 from lmcache.v1.multiprocess.request_handler import HandlerType, request_handler
 from lmcache.v1.multiprocess.token_hasher import TokenHasher
+from lmcache.v1.multiprocess.pp_bubble_trace import (
+    emit_event as _emit_bubble_event,
+    is_enabled as _bubble_trace_enabled,
+)
 from lmcache.v1.multiprocess.read_policy import TRANSFER_BORROW
 
 logger = init_logger(__name__)
@@ -123,6 +127,7 @@ class LookupModule:
         self._ctx = ctx
         self._prefetch_jobs: dict[str, _PrefetchJob] = {}
         self._prefetch_job_lock = threading.Lock()
+        self._bubble_trace_enabled = _bubble_trace_enabled()
         self._setup_metrics()
 
     @property
@@ -614,6 +619,14 @@ class LookupModule:
 
         with self._prefetch_job_lock:
             self._prefetch_jobs.pop(job.request_id, None)
+
+        if getattr(self, "_bubble_trace_enabled", False):
+            _emit_bubble_event(
+                "mp_server.lookup.done",
+                request_id=job.request_id,
+                hit_tokens=found_count * self._ctx.chunk_size,
+                requested_tokens=job.requested_tokens,
+            )
 
         return found_count
 
