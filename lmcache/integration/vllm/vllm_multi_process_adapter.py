@@ -36,6 +36,7 @@ from lmcache.utils import (
 from lmcache.v1.gpu_connector.utils import LayoutHints
 from lmcache.v1.multiprocess.custom_types import (
     KV_EVENT_CAPABILITY,
+    LOOKUP_RESULT_CAPABILITY,
     KV_EVENT_KIND_REMOVED,
     KV_EVENT_KIND_STORED,
     BlockAllocationRecord,
@@ -134,6 +135,8 @@ class ExtraConfigDefault(enum.Enum):
     heartbeat_interval = 10.0
     # Poll status replies without blocking the scheduler by default.
     nonblocking_lookup_status = True
+    # Stage-local PP lookup fastpath (inline lookup reply & zero short-circuit).
+    pp_query_fastpath = False
     # Routing mode for ``create_transfer_context``: ``auto`` resolves to
     # the device spec's declared default (derived from
     # ``is_lmcache_driven_available()``: CUDA and NPU -> lmcache_driven;
@@ -259,7 +262,7 @@ class _LookupAck:
     a reply that never arrives can be detected via ``submitted_at``.
     """
 
-    futures: dict[str, MessagingFuture[None]]
+    futures: dict[str, MessagingFuture[Any]]
     """Outstanding LOOKUP futures keyed by server URL; acked ones are removed."""
 
     submitted_at: float
@@ -742,6 +745,7 @@ class LMCacheMPSchedulerAdapter:
         self._nonblocking_lookup_status = (
             ExtraConfigDefault.nonblocking_lookup_status.default
         )
+        self._pp_query_fastpath = ExtraConfigDefault.pp_query_fastpath.default
         if extra_config is not None:
             cfg = _resolve_extra_config(extra_config)
             mq_timeout = cfg[ExtraConfigDefault.mq_timeout.name]
@@ -749,7 +753,20 @@ class LMCacheMPSchedulerAdapter:
             self._nonblocking_lookup_status = cfg[
                 ExtraConfigDefault.nonblocking_lookup_status.name
             ]
+            self._pp_query_fastpath = cfg[ExtraConfigDefault.pp_query_fastpath.name]
+        if self._pp_query_fastpath and not (
+            parallel_strategy.pp_stage_local
+            and parallel_strategy.pp_size > 1
+            and len(server_urls) == parallel_strategy.pp_size
+            and len(set(server_urls)) == len(server_urls)
+            and self._nonblocking_lookup_status
+        ):
+            raise ValueError(
+                "pp_query_fastpath requires stage-local PP>1, one distinct server "
+                "per stage, and nonblocking lookup status"
+            )
         self._mq_timeout = mq_timeout
+        self._inline_lookup_urls: set[str] = set()
 
         # Lookup state tracking:
         # - _pending_lookups: request_ids submitted but not yet resolved
@@ -793,6 +810,10 @@ class LMCacheMPSchedulerAdapter:
                 chunk_sizes[url] = get_lmcache_chunk_size(
                     client, timeout=self._mq_timeout
                 )
+                if self._pp_query_fastpath:
+                    capabilities = get_experimental(client, timeout=self._mq_timeout)
+                    if LOOKUP_RESULT_CAPABILITY in capabilities:
+                        self._inline_lookup_urls.add(url)
             except TimeoutError:
                 for c in self.req_clients.values():
                     c.close()
@@ -967,27 +988,31 @@ class LMCacheMPSchedulerAdapter:
             lookup_tokens // self.lmcache_tokens_per_chunk
         ) * self.lmcache_tokens_per_chunk
 
-        futures: dict[str, MessagingFuture[None]] = {
-            url: self.req_clients[url].lookup(
-                self._create_key(
-                    token_ids,
-                    start=0,
-                    end=aligned_end,
-                    request_id=request_id,
-                    cache_salt=cache_salt,
-                    request_configs=request_configs,
-                    server_url=url,
-                ).no_worker_id_version(),
-                self.tp_size,
+        futures: dict[str, MessagingFuture[Any]] = {}
+        submitted_at = time.monotonic()
+        for url in self._server_urls:
+            client = self.req_clients[url]
+            lookup = (
+                client.lookup_with_result
+                if url in self._inline_lookup_urls
+                else client.lookup
             )
-            for url in self._server_urls
-        }
+            key = self._create_key(
+                token_ids,
+                start=0,
+                end=aligned_end,
+                request_id=request_id,
+                cache_salt=cache_salt,
+                request_configs=request_configs,
+                server_url=url,
+            ).no_worker_id_version()
+            futures[url] = lookup(key, self.tp_size)
 
         # Do not wait for the acknowledgement here: that is a full server
         # round trip on the scheduler thread. check_lookup_result resolves
         # the futures lazily, one non-blocking poll per call.
         self._unacked_lookups[request_id] = _LookupAck(
-            futures=futures, submitted_at=time.monotonic()
+            futures=futures, submitted_at=submitted_at
         )
         self._pending_lookups.add(request_id)
         self._lookup_params[request_id] = (token_ids, cache_salt, request_configs)
@@ -1071,16 +1096,27 @@ class LMCacheMPSchedulerAdapter:
             # Aggregation already done; return the cached value.
             return self._finished_lookup_results[request_id]
 
+        per_server = self._per_server_hits.setdefault(request_id, {})
         ack = self._unacked_lookups.get(request_id)
         if ack is not None:
             # The server registers the prefetch job while handling LOOKUP.
-            # LOOKUP and QUERY_PREFETCH_STATUS run on the same server thread
-            # pool and may be reordered, and a status query for an unknown
-            # request_id answers 0: a spurious miss whose prefetch locks are
-            # never released. So never query until every server has acked.
-            ack.futures = {
-                url: fut for url, fut in ack.futures.items() if not fut.query()
-            }
+            # Ready inline replies hand over their integer chunk count directly,
+            # avoiding a second QUERY_PREFETCH_STATUS round trip.
+            if self._pp_query_fastpath:
+                for url, fut in list(ack.futures.items()):
+                    if fut.query():
+                        try:
+                            hits = fut.result(timeout=0)
+                        except TimeoutError:
+                            self._mark_lookup_timed_out(url)
+                            return 0
+                        del ack.futures[url]
+                        if hits is not None:
+                            per_server[url] = int(hits)
+            else:
+                ack.futures = {
+                    url: fut for url, fut in ack.futures.items() if not fut.query()
+                }
             if ack.futures:
                 if time.monotonic() - ack.submitted_at >= self._mq_timeout:
                     for url in ack.futures:
@@ -1094,7 +1130,6 @@ class LMCacheMPSchedulerAdapter:
         # Persistent accumulator for this request. A server present in
         # the dict has already handed over its final hit count and must
         # not be polled again; absence means "not yet observed".
-        per_server = self._per_server_hits.setdefault(request_id, {})
         unresolved_urls = [u for u in self._server_urls if u not in per_server]
 
         futures = self._lookup_status.setdefault(request_id, {})
