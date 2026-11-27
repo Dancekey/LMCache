@@ -510,14 +510,34 @@ def build_parallel_strategy_from_vllm_config(
         The constructed ParallelStrategy.
     """
     pc = vllm_config.parallel_config
+    is_mla = mla_only(vllm_config.model_config)
+    dcp_size = getattr(pc, "decode_context_parallel_size", 1)
+    ktc = getattr(vllm_config, "kv_transfer_config", None)
+    in_step_sync = (
+        bool(ktc.get_from_extra_config("lmcache.mp.in_step_sync_retrieve", False))
+        if ktc is not None
+        else False
+    ) or os.environ.get("AGY_MP_IN_STEP_RETRIEVE") == "1"
+    mla_bcast = (
+        bool(
+            ktc.get_from_extra_config(
+                "lmcache.mp.mla_tp_broadcast_retrieve", False
+            )
+        )
+        if ktc is not None
+        else False
+    ) or os.environ.get("AGY_MLA_TP_BROADCAST_RETRIEVE") == "1"
     return ParallelStrategy(
-        mla_only=mla_only(vllm_config.model_config),
+        mla_only=is_mla,
         vllm_world_size=pc.world_size,
         vllm_worker_id=pc.rank,
         tp_size=pc.tensor_parallel_size,
         pp_size=pc.pipeline_parallel_size,
         n_servers=n_servers,
-        dcp_size=getattr(pc, "decode_context_parallel_size", 1),
+        dcp_size=dcp_size,
+        single_mla_reader=bool(
+            is_mla and in_step_sync and mla_bcast and pc.tensor_parallel_size > 1 and dcp_size == 1
+        ),
     )
 
 
@@ -751,6 +771,14 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
                 )
             )
             or os.environ.get("AGY_MLA_TP_BROADCAST_RETRIEVE") == "1"
+        )
+        self._skip_lookup_when_apc_covered: bool = (
+            bool(
+                vllm_config.kv_transfer_config.get_from_extra_config(
+                    "lmcache.mp.skip_lookup_when_apc_covered", False
+                )
+            )
+            or os.environ.get("AGY_SKIP_LOOKUP_WHEN_APC_COVERED") == "1"
         )
         self._pp_rank: int = (
             vllm_config.parallel_config.rank
@@ -1574,6 +1602,26 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
             tracker.state = LMCacheMPRequestState.BYPASS_LMCACHE
             return 0, False
 
+        chunk_size = self.scheduler_adapter.lmcache_tokens_per_chunk
+        if getattr(self, "_skip_lookup_when_apc_covered", False):
+            lookup_tokens = max(
+                0,
+                len(tracker.get_token_ids())
+                - int(self._reserve_last_token_for_lookup),
+            )
+            aligned_lookup_end = (lookup_tokens // chunk_size) * chunk_size
+            if num_computed_tokens >= aligned_lookup_end:
+                tracker.num_vllm_hit_tokens = (
+                    num_computed_tokens
+                    // self._hit_alignment_tokens
+                    * self._hit_alignment_tokens
+                )
+                tracker.num_stored_tokens = max(
+                    tracker.num_stored_tokens, aligned_lookup_end
+                )
+                self.scheduler_adapter.cleanup_lookup_result(request.request_id)
+                return 0, False
+
         if tracker.lookup_started_at is None:
             tracker.lookup_started_at = time.monotonic()
         lookup_pending = self.scheduler_adapter.maybe_submit_lookup_request(
@@ -1613,12 +1661,18 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         if ret == 0:
             return 0, False
 
-        assert ret % self.scheduler_adapter.lmcache_tokens_per_chunk == 0
+        assert ret % chunk_size == 0
 
         # A hint can be evicted before transfer. Only legacy treats it as
-        # successful storage progress; the borrow path may need full recompute.
+        # successful storage progress; the borrow path may need full recompute,
+        # EXCEPT for chunks already matched in BOTH local HBM APC and L1!
         if getattr(self, "_read_policy", "legacy") != "transfer_borrow":
             tracker.num_stored_tokens = ret
+        else:
+            apc_chunk_aligned = (num_computed_tokens // chunk_size) * chunk_size
+            tracker.num_stored_tokens = max(
+                tracker.num_stored_tokens, min(ret, apc_chunk_aligned)
+            )
         tracker.num_lmcache_hit_tokens = ret
 
         need_to_load = max(0, ret - num_computed_tokens)
@@ -1654,7 +1708,11 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         """
         if self.role != KVConnectorRole.SCHEDULER:
             return
-        if not self._eager_prefetch or request.resumable:
+        if (
+            not self._eager_prefetch
+            or getattr(self, "_skip_lookup_when_apc_covered", False)
+            or request.resumable
+        ):
             return
 
         tracker = self._get_or_create_request_tracker(request)

@@ -148,6 +148,11 @@ class ExtraConfigDefault(enum.Enum):
     # start_load_kv (load_kv_async=False) instead of parking requests in a
     # 2-step WAITING_FOR_REMOTE_KVS barrier across PP batch_queue steps.
     in_step_sync_retrieve = False
+    # Restrict MLA stage-local PCIe retrieve to the single stage writer rank and
+    # broadcast unique loaded blocks intra-stage over TP (HCCS/NVLink).
+    mla_tp_broadcast_retrieve = False
+    # Skip remote ZMQ lookup when local vLLM APC already covers all full chunks.
+    skip_lookup_when_apc_covered = False
     # Routing mode for ``create_transfer_context``: ``auto`` resolves to
     # the device spec's declared default (derived from
     # ``is_lmcache_driven_available()``: CUDA and NPU -> lmcache_driven;
@@ -413,6 +418,9 @@ class ParallelStrategy:
     pp_stage_local: bool = False
     """One complete PP stage per server; selected by the native connector."""
 
+    single_mla_reader: bool = False
+    """True when only the stage writer rank retrieves from MP server and broadcasts over TP."""
+
     @property
     def kv_world_size(self) -> int:
         """Number of pieces a single token chunk's KV cache is split into
@@ -453,7 +461,7 @@ class ParallelStrategy:
         split never under-reserves (the server takes one read lock per
         declared reader).
         """
-        if not self.mla_only:
+        if not self.mla_only or (self.single_mla_reader and self.dcp_size == 1):
             return 1
         return math.ceil(self.kv_tp_size / self.dcp_size)
 
@@ -909,10 +917,18 @@ class LMCacheMPSchedulerAdapter:
                     f"PP server {url} has incomplete or mismatched registration"
                 )
             profile = status.profile
+            expected_profile_readers = (
+                self.parallel_strategy.kv_tp_size
+                if (
+                    self.parallel_strategy.mla_only
+                    and self.parallel_strategy.single_mla_reader
+                )
+                else self.parallel_strategy.num_kv_readers
+            )
             if (
                 profile.mla_only != self.parallel_strategy.mla_only
                 or profile.kv_world_size != self.world_size
-                or profile.num_kv_readers != self.parallel_strategy.num_kv_readers
+                or profile.num_kv_readers != expected_profile_readers
             ):
                 raise ValueError(f"PP server {url} has incompatible cache geometry")
             if status.server_instance_id in server_ids:

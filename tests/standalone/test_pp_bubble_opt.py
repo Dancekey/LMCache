@@ -463,6 +463,136 @@ class PPBubbleOptTests(unittest.TestCase):
                 else:
                     sys.modules[k] = v
 
+    def test_single_mla_reader_sets_num_kv_readers_to_one(self) -> None:
+        tree = ast.parse(ADAPTER_PATH.read_text(encoding="utf-8"))
+        ps_cls = next(
+            n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "ParallelStrategy"
+        )
+        from dataclasses import dataclass
+        import math
+
+        mod = ast.Module(body=[ps_cls], type_ignores=[])
+        ns = {"dataclass": dataclass, "math": math}
+        exec(compile(ast.fix_missing_locations(mod), "<ps>", "exec"), ns)
+        ParallelStrategy = ns["ParallelStrategy"]
+
+        ps_default = ParallelStrategy(
+            mla_only=True, vllm_world_size=32, vllm_worker_id=0,
+            tp_size=16, pp_size=2, n_servers=2, pp_stage_local=True,
+        )
+        self.assertEqual(ps_default.num_kv_readers, 16)
+
+        ps_bcast = ParallelStrategy(
+            mla_only=True, vllm_world_size=32, vllm_worker_id=0,
+            tp_size=16, pp_size=2, n_servers=2, pp_stage_local=True,
+            single_mla_reader=True,
+        )
+        self.assertEqual(ps_bcast.num_kv_readers, 1)
+
+        ps_dcp2 = ParallelStrategy(
+            mla_only=True, vllm_world_size=32, vllm_worker_id=0,
+            tp_size=16, pp_size=2, n_servers=2, dcp_size=2, pp_stage_local=True,
+            single_mla_reader=True,
+        )
+        self.assertEqual(ps_dcp2.num_kv_readers, 8)
+
+    def test_apc_covered_lookup_skip_and_store_dedup(self) -> None:
+        import time
+
+        fn_node = _extract_method(
+            CONNECTOR_PATH, "LMCacheMPConnector", "get_num_new_matched_tokens"
+        )
+        on_new_node = _extract_method(
+            CONNECTOR_PATH, "LMCacheMPConnector", "on_new_request"
+        )
+        ns = {
+            "time": time,
+            "LMCacheMPRequestState": SimpleNamespace(
+                PREFETCHING="PREFETCHING",
+                READY="READY",
+                BYPASS_LMCACHE="BYPASS_LMCACHE",
+            ),
+            "RequestStatus": SimpleNamespace(PREEMPTED="PREEMPTED"),
+            "KVConnectorRole": SimpleNamespace(SCHEDULER="SCHEDULER", WORKER="WORKER"),
+            "logger": SimpleNamespace(
+                warning=lambda *_a, **_k: None,
+                info=lambda *_a, **_k: None,
+                debug=lambda *_a, **_k: None,
+            ),
+        }
+        get_matched = _compile_method(fn_node, ns)
+        on_new = _compile_method(on_new_node, ns)
+
+        lookups_sent: list[str] = []
+        cleaned: list[str] = []
+
+        def make_tracker(prompt_len: int = 8192):
+            return SimpleNamespace(
+                state="PREFETCHING",
+                num_lmcache_hit_tokens=0,
+                num_vllm_hit_tokens=0,
+                num_stored_tokens=0,
+                borrowed_restore_submitted=False,
+                allocated_block_ids={},
+                lookup_started_at=None,
+                cache_salt="",
+                request_configs=None,
+                get_token_ids=lambda: [1] * prompt_len,
+            )
+
+        tracker_full = make_tracker(8192)
+        conn = SimpleNamespace(
+            role="SCHEDULER",
+            _eager_prefetch=True,
+            _skip_lookup_when_apc_covered=True,
+            _reserve_last_token_for_lookup=True,
+            _hit_alignment_tokens=128,
+            _read_policy="legacy",
+            _in_step_sync_retrieve=True,
+            _get_or_create_request_tracker=lambda _r: tracker_full,
+            _connector_stats=SimpleNamespace(record_lookup=lambda _d: None),
+            scheduler_adapter=SimpleNamespace(
+                lmcache_tokens_per_chunk=512,
+                maybe_submit_lookup_request=lambda req_id, **_k: (lookups_sent.append(req_id) or True),
+                check_lookup_result=lambda _id: 7168,
+                cleanup_lookup_result=lambda req_id: cleaned.append(req_id),
+            ),
+        )
+        req = SimpleNamespace(
+            request_id="req-apc-full",
+            num_computed_tokens=7808,
+            all_token_ids=[1] * 8192,
+            status="WAITING",
+            resumable=False,
+        )
+        # 1. on_new_request must NOT fire eager lookup when _skip_lookup_when_apc_covered=True
+        on_new(conn, req)
+        self.assertEqual(lookups_sent, [])
+
+        # 2. num_computed_tokens=7808 >= aligned_lookup_end(8191//512*512=7680): skip lookup completely!
+        matched, is_async = get_matched(conn, req, 7808)
+        self.assertEqual((matched, is_async), (0, False))
+        self.assertEqual(lookups_sent, [])
+        self.assertEqual(tracker_full.num_stored_tokens, 7680)
+        self.assertEqual(tracker_full.num_vllm_hit_tokens, 7808)
+
+        # 3. single_prefix partial APC (7296 < 7680) with L1 hit=7168 under transfer_borrow:
+        #    tracker.num_stored_tokens MUST advance to 7168 so [0..7168) is NOT re-stored!
+        tracker_sp = make_tracker(8192)
+        conn._get_or_create_request_tracker = lambda _r: tracker_sp
+        conn._read_policy = "transfer_borrow"
+        req_sp = SimpleNamespace(
+            request_id="req-single-prefix",
+            num_computed_tokens=7296,
+            all_token_ids=[1] * 8192,
+            status="WAITING",
+            resumable=False,
+        )
+        matched_sp, is_async_sp = get_matched(conn, req_sp, 7296)
+        self.assertEqual((matched_sp, is_async_sp), (0, False))
+        self.assertEqual(lookups_sent, ["req-single-prefix"])
+        self.assertEqual(tracker_sp.num_stored_tokens, 7168)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
