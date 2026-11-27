@@ -24,6 +24,7 @@ from lmcache.v1.distributed.config import (
     StorageManagerConfig,
     add_storage_manager_args,
     parse_args_to_config,
+    validate_l1_numa_sharding_compatibility,
 )
 from lmcache.v1.distributed.storage_manager import StorageManager
 from lmcache.v1.mp_observability.config import (
@@ -430,6 +431,12 @@ def run_cache_server(
 
     maybe_initialize_trace_recorder(
         event_bus, obs_config, storage_manager_config, instance_id=mp_config.instance_id
+    )
+
+    validate_l1_numa_sharding_compatibility(
+        storage_manager_config,
+        p2p_enabled=mp_config.p2p_config.enabled,
+        transfer_mode=mp_config.supported_transfer_mode,
     )
 
     # When the engine-driven path is loaded (auto or engine_driven):

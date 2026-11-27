@@ -127,7 +127,13 @@ def _parse_l1_common(
         ):
             raise ValueError(f"{name} must be between zero and one")
     return cls(
-        L1MemoryManagerConfig(size, False, align_bytes=align, shm_name=""),
+        L1MemoryManagerConfig(
+            size,
+            False,
+            align_bytes=align,
+            shm_name="",
+            use_numa_sharding=False,
+        ),
         tag=tag,
         eviction=eviction,
         read_ttl_seconds=read_ttl,
@@ -281,6 +287,21 @@ def _infer_l1_devdax_overflow_from_dax_adapter(
     l2_adapter_config.adapters = remaining_adapters
 
 
+def _default_l1_use_numa_sharding() -> bool:
+    """Opt-in NUMA sharding switch; defaults to ``False`` unless configured."""
+    raw = os.environ.get("LMCACHE_L1_NUMA_SHARDING", "").strip().lower()
+    if not raw:
+        return False
+    if raw in ("1", "true", "yes", "on"):
+        return True
+    if raw in ("0", "false", "no", "off"):
+        return False
+    raise ValueError(
+        f"Invalid LMCACHE_L1_NUMA_SHARDING={raw!r}; expected a boolean "
+        "(1/0, true/false, yes/no, on/off)"
+    )
+
+
 @dataclass
 class L1MemoryManagerConfig:
     """
@@ -310,6 +331,9 @@ class L1MemoryManagerConfig:
 
     devdax_size_in_bytes: int = 0
     """ Optional Device-DAX overflow size for hybrid DRAM + DAX L1. """
+
+    use_numa_sharding: bool = field(default_factory=_default_l1_use_numa_sharding)
+    """ Opt-in per-NUMA sharding for pinned DRAM L1 (default False). """
 
     def __post_init__(self):
         self.init_size_in_bytes = min(self.init_size_in_bytes, self.size_in_bytes)
@@ -351,6 +375,12 @@ class L1MemoryManagerConfig:
                 "supported on the current backend. Disabling l1-use-lazy."
             )
             self.use_lazy = False
+
+        if self.use_numa_sharding and not self.use_lazy:
+            raise ValueError(
+                "--l1-numa-sharding requires --l1-use-lazy "
+                "(pinned DRAM L1 without hugepages or Device-DAX)."
+            )
 
 
 @dataclass
@@ -691,6 +721,53 @@ def normalize_storage_manager_config(config: StorageManagerConfig) -> None:
             config.l2_adapter_config,
             config.l1_manager_config.tag,
         )
+    validate_l1_numa_sharding_compatibility(config)
+
+
+def validate_l1_numa_sharding_compatibility(
+    config: StorageManagerConfig,
+    *,
+    p2p_enabled: bool = False,
+    transfer_mode: str = "lmcache_driven",
+) -> None:
+    """Validate L1 NUMA sharding against L2, P2P, GDS, and transfer-mode constraints.
+
+    Raises:
+        ValueError: If ``use_numa_sharding`` is enabled alongside any feature
+            requiring a single contiguous L1 memory region or non-DRAM L1 tier.
+    """
+    by_tag = {c.tag: c for c in config.l1_manager_configs}
+    single_region_reasons: dict[str, list[str]] = {tag: [] for tag in by_tag}
+
+    for adapter_config in config.l2_adapter_config.adapters:
+        adapter_name = requires_single_l1_memory_region(adapter_config)
+        if adapter_name and adapter_config.affinity_tag in single_region_reasons:
+            single_region_reasons[adapter_config.affinity_tag].append(
+                f"L2 adapter {adapter_name!r}"
+            )
+
+    if p2p_enabled:
+        for reasons in single_region_reasons.values():
+            reasons.append("P2P (--p2p-advertise-url)")
+    if transfer_mode != "lmcache_driven":
+        for reasons in single_region_reasons.values():
+            reasons.append(f"supported_transfer_mode={transfer_mode!r}")
+
+    for tag, l1_cfg in by_tag.items():
+        mem_cfg = l1_cfg.memory_config
+        if not mem_cfg.use_numa_sharding:
+            continue
+        reasons = list(single_region_reasons[tag])
+        if l1_cfg.gds_l1_config is not None:
+            reasons.append("GDS L1 (--gds-l1-path)")
+        if not reasons:
+            continue
+        joined = ", ".join(reasons)
+        raise ValueError(
+            "--l1-numa-sharding splits L1 across multiple pinned buffers and "
+            f"is incompatible with: {joined}. Disable --l1-numa-sharding "
+            "(or pass --no-l1-numa-sharding)."
+        )
 
 
 def validate_storage_manager_config(config: StorageManagerConfig) -> None:
@@ -755,6 +832,8 @@ def l1_exposes_single_memory_region(config: StorageManagerConfig) -> bool:
     if l1_config.gds_l1_config is not None:
         return False
     if l1_config.memory_config.devdax_path:
+        return False
+    if l1_config.memory_config.use_numa_sharding:
         return False
     return True
 
@@ -848,6 +927,17 @@ def add_storage_manager_args(
             'map. Set --no-l1-use-lazy and --shm-name "". '
             "If a DAX L2 adapter with the same device_path is registered, "
             "that adapter's max_dax_size_gb is used as L1 overflow size."
+        ),
+    )
+    memory_group.add_argument(
+        "--l1-numa-sharding",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Opt-in NUMA-aware sharding for pinned DRAM L1. When enabled, "
+            "synchronously pins the full --l1-size-gb across process-accessible "
+            "NUMA nodes using MemFree water-filling (--l1-init-size-gb is not "
+            "used on this path). Default is False. Env: LMCACHE_L1_NUMA_SHARDING."
         ),
     )
 
@@ -1026,8 +1116,15 @@ def parse_args_to_config(
             args.l1_size_gb is not None
             or args.gds_l1_path is not None
             or args.l1_devdax_path is not None
+            or getattr(args, "l1_numa_sharding", None) is not None
         ):
             raise ValueError("Use either --l1-manager or legacy L1 flags")
+        if _default_l1_use_numa_sharding():
+            raise ValueError(
+                "LMCACHE_L1_NUMA_SHARDING is not supported with --l1-manager "
+                "JSON; use legacy --l1-size-gb flags or unset "
+                "LMCACHE_L1_NUMA_SHARDING."
+            )
         classes: dict[
             str,
             type[DRAML1ManagerConfig]
@@ -1090,6 +1187,13 @@ def parse_args_to_config(
             logger.error("Hugepage availability check failed: %s", e)
             raise
 
+    raw_numa_sharding = getattr(args, "l1_numa_sharding", None)
+    use_numa_sharding = (
+        bool(raw_numa_sharding)
+        if raw_numa_sharding is not None
+        else _default_l1_use_numa_sharding()
+    )
+
     if shm_name is None:
         memory_config = L1MemoryManagerConfig(
             size_in_bytes=int(args.l1_size_gb * (1 << 30)),
@@ -1098,6 +1202,7 @@ def parse_args_to_config(
             align_bytes=args.l1_align_bytes,
             use_hugepages=use_hugepages,
             devdax_path=args.l1_devdax_path,
+            use_numa_sharding=use_numa_sharding,
         )
     else:
         memory_config = L1MemoryManagerConfig(
@@ -1108,6 +1213,7 @@ def parse_args_to_config(
             shm_name=shm_name,
             use_hugepages=use_hugepages,
             devdax_path=args.l1_devdax_path,
+            use_numa_sharding=use_numa_sharding,
         )
 
     gds_l1_config: GdsL1Config | None = None

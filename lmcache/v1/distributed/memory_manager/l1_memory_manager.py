@@ -52,6 +52,20 @@ def create_memory_allocator(config: L1MemoryManagerConfig) -> MemoryAllocatorInt
         MemoryAllocatorInterface: An instance of a memory allocator.
     """
     if config.use_lazy:
+        if config.use_numa_sharding:
+            from lmcache.v1.memory_allocators.numa_sharded_pinned_allocator import (
+                NumaShardedPinnedAllocator,
+            )
+
+            logger.info(
+                "Using NumaShardedPinnedAllocator: size=%d bytes, align=%d bytes",
+                config.size_in_bytes,
+                config.align_bytes,
+            )
+            return NumaShardedPinnedAllocator(
+                size_in_bytes=config.size_in_bytes,
+                align_bytes=config.align_bytes,
+            )
         logger.debug(
             "use lazy memory allocator, init size is %d bytes, "
             "final size is %d bytes, align bytes is %d bytes",
@@ -192,13 +206,15 @@ class L1MemoryManager:
         used_size = total_size - free_size
         return used_size, total_size
 
-    def get_l1_memory_desc(self) -> L1MemoryDesc:
+    def get_l1_memory_desc(self) -> L1MemoryDesc | None:
         """
-        Return an L1MemoryDesc describing the underlying memory buffer.
+        Return an L1MemoryDesc describing the underlying memory buffer, or
+        ``None`` when the backing allocator spans multiple non-contiguous
+        shards (e.g. ``NumaShardedPinnedAllocator``).
 
         Returns:
             Descriptor containing the final L1 arena and its stable-size
-            snapshot.
+            snapshot, or ``None`` if no single contiguous region exists.
 
         Raises:
             NotImplementedError: If the allocator type does not support this operation.
@@ -211,6 +227,8 @@ class L1MemoryManager:
                 None if self._allocator.shm_name else self._size_in_bytes
             )
         elif isinstance(self._allocator, LazyMemoryAllocator):
+            if not getattr(self._allocator, "exposes_single_buffer", True):
+                return None
             # TODO(ApostaC): need to test if the RDMA registration works
             # before the lazy expansion is finished
             buffer = self._allocator.get_underlying_buffer()
