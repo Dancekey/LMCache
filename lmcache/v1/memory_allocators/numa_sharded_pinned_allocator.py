@@ -199,9 +199,6 @@ class NumaShardedPinnedAllocator(LazyMemoryAllocator):
         self,
         size_in_bytes: int,
         align_bytes: int = AddressManager.ALIGN_BYTES,
-        numa_policy: str = "auto",
-        numa_nodes: Sequence[int] | None = None,
-        numa_headroom_bytes: int = 32 << 30,
         *,
         alloc_fn: Callable[[int, int], int] | None = None,
         free_fn: Callable[[int], Any] | None = None,
@@ -223,7 +220,6 @@ class NumaShardedPinnedAllocator(LazyMemoryAllocator):
         self._alloc_fn = alloc_fn
         self._free_fn = free_fn
         self._align_bytes = align_bytes
-        self._numa_policy = numa_policy
         self._lock = threading.Lock()
         self._rr_cursor = 0
         self._closed = False
@@ -241,7 +237,7 @@ class NumaShardedPinnedAllocator(LazyMemoryAllocator):
             discover_kwargs: dict[str, Any] = {}
             if sysfs_root is not None:
                 discover_kwargs["sysfs_root"] = sysfs_root
-            nodes = discover_process_numa_nodes(numa_nodes, **discover_kwargs)
+            nodes = discover_process_numa_nodes(**discover_kwargs)
         else:
             nodes = list(topo_nodes)
 
@@ -251,10 +247,8 @@ class NumaShardedPinnedAllocator(LazyMemoryAllocator):
         plans: list[ShardPlan] = plan_numa_shards(
             total_bytes=size_in_bytes,
             align_bytes=align_bytes,
-            policy=numa_policy,
             nodes=nodes,
             memfree_by_node=memfree_before,
-            headroom_bytes=numa_headroom_bytes,
         )
         self._plans = list(plans)
         self._final_size = sum(p.size_bytes for p in plans)
@@ -361,9 +355,8 @@ class NumaShardedPinnedAllocator(LazyMemoryAllocator):
             for nid in all_node_ids
         )
         logger.info(
-            "Initialized NumaShardedPinnedAllocator: policy=%s, shards=%d, "
+            "Initialized NumaShardedPinnedAllocator: shards=%d, "
             "total=%.2f GiB, MemFree summary=[%s]",
-            numa_policy,
             len(self._shards),
             self._final_size / (1 << 30),
             summary,

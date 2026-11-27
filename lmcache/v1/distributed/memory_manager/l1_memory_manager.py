@@ -52,26 +52,19 @@ def create_memory_allocator(config: L1MemoryManagerConfig) -> MemoryAllocatorInt
         MemoryAllocatorInterface: An instance of a memory allocator.
     """
     if config.use_lazy:
-        if config.numa_policy != "disabled":
+        if config.use_numa_sharding:
             from lmcache.v1.memory_allocators.numa_sharded_pinned_allocator import (
                 NumaShardedPinnedAllocator,
             )
 
             logger.info(
-                "Using NumaShardedPinnedAllocator: size=%d bytes, align=%d bytes, "
-                "policy=%s, nodes=%s, headroom=%d bytes",
+                "Using NumaShardedPinnedAllocator: size=%d bytes, align=%d bytes",
                 config.size_in_bytes,
                 config.align_bytes,
-                config.numa_policy,
-                config.numa_nodes,
-                config.numa_headroom_bytes,
             )
             return NumaShardedPinnedAllocator(
                 size_in_bytes=config.size_in_bytes,
                 align_bytes=config.align_bytes,
-                numa_policy=config.numa_policy,
-                numa_nodes=config.numa_nodes,
-                numa_headroom_bytes=config.numa_headroom_bytes,
             )
         logger.debug(
             "use lazy memory allocator, init size is %d bytes, "

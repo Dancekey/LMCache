@@ -23,7 +23,7 @@ from lmcache.v1.distributed.config import (
     get_arg_parser,
     l1_exposes_single_memory_region,
     parse_args_to_config,
-    resolve_effective_l1_numa_policy,
+    validate_l1_numa_sharding_compatibility,
 )
 from lmcache.v1.distributed.error import L1Error
 from lmcache.v1.distributed.l2_adapters.config import L2AdaptersConfig
@@ -99,7 +99,7 @@ def _make_nodes(count: int = 8, cpus_per_node: int = 24) -> list[NumaNodeInfo]:
 # ---------------------------------------------------------------------------
 
 
-def test_discover_process_numa_nodes_respects_cpuset_mems_and_explicit(tmp_path: Path):
+def test_discover_process_numa_nodes_respects_cpuset_and_mems(tmp_path: Path):
     (tmp_path / "online").write_text("0-3\n", encoding="utf-8")
     for nid, (cpulist, mem_kb, free_kb) in {
         0: ("0-7", 256 * 1024 * 1024, 180 * 1024 * 1024),
@@ -141,36 +141,27 @@ def test_discover_process_numa_nodes_respects_cpuset_mems_and_explicit(tmp_path:
     assert memfree[0] == 180 * GiB
     assert memfree[3] == 160 * GiB
 
-    with pytest.raises(ValueError, match="not online"):
-        discover_process_numa_nodes(
-            explicit_nodes=[0, 7],
-            sysfs_root=tmp_path,
-            allowed_cpus=frozenset(range(0, 32)),
-        )
-
 
 # ---------------------------------------------------------------------------
-# 2. Planner Case A (even), Case B (skewed water-filling), Case C1/C2 fallback
+# 2. Parameter-free MemFree water-filling planner
 # ---------------------------------------------------------------------------
 
 
-def test_plan_case_a_clean_nodes_exact_even_split():
+def test_plan_balanced_nodes_produces_exact_even_split():
     nodes = _make_nodes(8)
     memfree = {i: 180 * GiB for i in range(8)}
     plans = plan_numa_shards(
         total_bytes=480 * GiB,
         align_bytes=4096,
-        policy="auto",
         nodes=nodes,
         memfree_by_node=memfree,
-        headroom_bytes=32 * GiB,
     )
     assert len(plans) == 8
     assert [p.size_bytes for p in plans] == [60 * GiB] * 8
     assert sum(p.size_bytes for p in plans) == 480 * GiB
 
 
-def test_plan_case_b_skewed_water_filling_preserves_headroom():
+def test_plan_skewed_nodes_equalizes_post_alloc_memfree_and_avoids_tight_nodes():
     nodes = _make_nodes(8)
     memfree = {
         0: 184 * GiB,
@@ -185,65 +176,55 @@ def test_plan_case_b_skewed_water_filling_preserves_headroom():
     plans = plan_numa_shards(
         total_bytes=480 * GiB,
         align_bytes=4096,
-        policy="auto",
         nodes=nodes,
         memfree_by_node=memfree,
-        headroom_bytes=32 * GiB,
     )
     by_node = {p.node_id: p.size_bytes for p in plans}
     assert sum(by_node.values()) == 480 * GiB
     for tight in (2, 3, 6, 7):
         assert tight not in by_node
-    for spacious in (0, 1, 4, 5):
-        assert spacious in by_node
-        assert memfree[spacious] - by_node[spacious] >= 32 * GiB
-        assert by_node[spacious] % 65536 == 0
+    post_free = [memfree[n] - by_node[n] for n in (0, 1, 4, 5)]
+    assert max(post_free) - min(post_free) <= 65536
+    assert min(post_free) >= 42 * GiB
+    for n in (0, 1, 4, 5):
+        assert by_node[n] % 65536 == 0
 
 
-def test_even_spread_keeps_aligned_remainder_within_node_cap():
+def test_water_fill_keeps_aligned_remainder_within_node_cap():
     block = 65536
     nodes = _make_nodes(4)
     plan = plan_numa_shards(
-        10 * block, block, "auto", nodes, dict.fromkeys(range(4), 3 * block), 0
+        10 * block, block, nodes, dict.fromkeys(range(4), 3 * block)
     )
     assert [shard.size_bytes // block for shard in plan] == [3, 3, 2, 2]
+    assert all(shard.size_bytes <= 3 * block for shard in plan)
 
 
-def test_water_fill_spreads_aligned_remainder_evenly_across_unfilled_nodes():
+def test_water_fill_drops_below_floor_nodes_and_equalizes_spacious_nodes():
     block = 65536
     nodes = _make_nodes(5)
-    for upper in (4, 10):
-        memfree = {0: 1 * block, **{i: upper * block for i in range(1, 5)}}
-        plan = plan_numa_shards(12 * block, block, "auto", nodes, memfree, 0)
-        assert [shard.size_bytes // block for shard in plan] == [1, 3, 3, 3, 2]
-        assert all(shard.size_bytes <= memfree[shard.node_id] for shard in plan)
+    memfree = {0: 1 * block, **{i: 4 * block for i in range(1, 5)}}
+    plan = plan_numa_shards(12 * block, block, nodes, memfree)
+    assert [(s.node_id, s.size_bytes // block) for s in plan] == [
+        (1, 3),
+        (2, 3),
+        (3, 3),
+        (4, 3),
+    ]
+    assert all(s.size_bytes <= memfree[s.node_id] for s in plan)
 
 
-def test_plan_case_c1_relaxed_headroom_and_c2_low_total_memfree_fallback():
+def test_plan_low_total_memfree_falls_back_to_even_split():
     nodes = _make_nodes(8)
-    memfree_c1 = {i: 65 * GiB for i in range(8)}
-    plans_c1 = plan_numa_shards(
+    memfree_low = {i: 30 * GiB for i in range(8)}
+    plans = plan_numa_shards(
         total_bytes=480 * GiB,
         align_bytes=4096,
-        policy="auto",
         nodes=nodes,
-        memfree_by_node=memfree_c1,
-        headroom_bytes=32 * GiB,
+        memfree_by_node=memfree_low,
     )
-    assert sum(p.size_bytes for p in plans_c1) == 480 * GiB
-    assert [p.size_bytes for p in plans_c1] == [60 * GiB] * 8
-
-    memfree_c2 = {i: 30 * GiB for i in range(8)}
-    plans_c2 = plan_numa_shards(
-        total_bytes=480 * GiB,
-        align_bytes=4096,
-        policy="auto",
-        nodes=nodes,
-        memfree_by_node=memfree_c2,
-        headroom_bytes=32 * GiB,
-    )
-    assert sum(p.size_bytes for p in plans_c2) == 480 * GiB
-    assert [p.size_bytes for p in plans_c2] == [60 * GiB] * 8
+    assert sum(p.size_bytes for p in plans) == 480 * GiB
+    assert [p.size_bytes for p in plans] == [60 * GiB] * 8
 
 
 # ---------------------------------------------------------------------------
@@ -260,7 +241,6 @@ def test_sharded_allocator_cross_shard_batch_data_integrity_and_oom_rollback():
     alloc = NumaShardedPinnedAllocator(
         size_in_bytes=16 * MiB,
         align_bytes=4096,
-        numa_policy="even",
         topo_nodes=nodes,
         alloc_fn=pool.alloc,
         free_fn=pool.free,
@@ -338,7 +318,7 @@ def test_sharded_allocator_cross_shard_batch_data_integrity_and_oom_rollback():
 
 
 # ---------------------------------------------------------------------------
-# 4. Partial-init failure rollback, wrap failure cleanup, and close() retry
+# 4. Partial-init rollback, alignment check, double-fault quarantine, close retry
 # ---------------------------------------------------------------------------
 
 
@@ -351,7 +331,6 @@ def test_sharded_allocator_init_failure_rolls_back_reverse_and_restores_affinity
         NumaShardedPinnedAllocator(
             size_in_bytes=16 * MiB,
             align_bytes=4096,
-            numa_policy="even",
             topo_nodes=nodes,
             alloc_fn=pool.alloc,
             free_fn=pool.free,
@@ -418,7 +397,6 @@ def test_misaligned_shard_base_pointer_fails_fast_and_rolls_back():
         NumaShardedPinnedAllocator(
             size_in_bytes=4 * MiB,
             align_bytes=4096,
-            numa_policy="even",
             topo_nodes=_make_nodes(2),
             alloc_fn=pool.alloc,
             free_fn=pool.free,
@@ -445,7 +423,6 @@ def test_init_rollback_double_fault_quarantines_and_retries_unreleased_shards():
         NumaShardedPinnedAllocator(
             size_in_bytes=16 * MiB,
             align_bytes=4096,
-            numa_policy="even",
             topo_nodes=_make_nodes(4),
             alloc_fn=pool.alloc,
             free_fn=flaky_free,
@@ -458,7 +435,6 @@ def test_init_rollback_double_fault_quarantines_and_retries_unreleased_shards():
     assert len(stranded) == 1
     assert stranded[0].ptr == pool.allocated_ptrs[0]
     assert stranded[0].released is False
-    # Shard 1 freed during reverse rollback; shard 0 remained quarantined.
     assert pool.freed_ptrs == [pool.allocated_ptrs[1]]
 
     remaining = retry_unreleased_init_shards()
@@ -479,16 +455,10 @@ def test_l1_memory_manager_and_storage_manager_pure_dram_sharded_startup():
     def _patched_sharded_factory(
         size_in_bytes: int,
         align_bytes: int = 4096,
-        numa_policy: str = "auto",
-        numa_nodes=None,
-        numa_headroom_bytes: int = 32 * GiB,
     ) -> NumaShardedPinnedAllocator:
         return NumaShardedPinnedAllocator(
             size_in_bytes=size_in_bytes,
             align_bytes=align_bytes,
-            numa_policy=numa_policy,
-            numa_nodes=numa_nodes,
-            numa_headroom_bytes=numa_headroom_bytes,
             topo_nodes=nodes,
             alloc_fn=pool.alloc,
             free_fn=pool.free,
@@ -509,8 +479,7 @@ def test_l1_memory_manager_and_storage_manager_pure_dram_sharded_startup():
             size_in_bytes=8 * MiB,
             use_lazy=True,
             align_bytes=4096,
-            numa_policy="auto",
-            numa_headroom_bytes=32 * GiB,
+            use_numa_sharding=True,
         )
         mgr = L1MemoryManager(mem_cfg)
         try:
@@ -550,7 +519,6 @@ def test_sharded_allocator_thread_safety_under_concurrent_alloc_and_free():
     alloc = NumaShardedPinnedAllocator(
         size_in_bytes=32 * MiB,
         align_bytes=4096,
-        numa_policy="even",
         topo_nodes=nodes,
         alloc_fn=pool.alloc,
         free_fn=pool.free,
@@ -586,103 +554,44 @@ def test_sharded_allocator_thread_safety_under_concurrent_alloc_and_free():
 
 
 # ---------------------------------------------------------------------------
-# 6. Opt-in CLI/env configuration & P2P / transfer_mode compatibility
+# 6. Opt-in CLI/env configuration & compatibility validation
 # ---------------------------------------------------------------------------
 
 
-def test_opt_in_default_disabled_cli_env_and_compatibility_resolution():
+def test_opt_in_default_disabled_cli_env_and_compatibility_validation():
     fake_spec = SimpleNamespace(device_type="npu", is_pin_supported=True)
     with (
         patch("lmcache.v1.distributed.config.current_device_spec", fake_spec),
         patch.dict(os.environ, {}, clear=False),
     ):
-        os.environ.pop("LMCACHE_L1_NUMA_POLICY", None)
-        os.environ.pop("LMCACHE_L1_NUMA_NODES", None)
-        os.environ.pop("LMCACHE_L1_NUMA_HEADROOM_GB", None)
+        os.environ.pop("LMCACHE_L1_NUMA_SHARDING", None)
         parser = get_arg_parser()
 
-        # Default MUST remain 'disabled' (opt-in feature, zero default behavior change).
+        # Default MUST remain False (opt-in feature, zero default behavior change).
         args_default = parser.parse_args(
             ["--l1-size-gb", "480", "--eviction-policy", "LRU"]
         )
         cfg_default = parse_args_to_config(args_default)
-        assert cfg_default.l1_manager_config.memory_config.numa_policy == "disabled"
+        assert cfg_default.l1_manager_config.memory_config.use_numa_sharding is False
         assert l1_exposes_single_memory_region(cfg_default) is True
 
-        # Explicit --l1-numa-policy auto enables sharding; P2P downgrades to disabled.
-        args_auto = parser.parse_args(
-            [
-                "--l1-size-gb",
-                "480",
-                "--eviction-policy",
-                "LRU",
-                "--l1-numa-policy",
-                "auto",
-            ]
+        # Explicit --l1-numa-sharding enables sharding; P2P / engine_driven raise ValueError.
+        args_on = parser.parse_args(
+            ["--l1-size-gb", "480", "--eviction-policy", "LRU", "--l1-numa-sharding"]
         )
-        cfg_auto = parse_args_to_config(args_auto)
-        assert cfg_auto.l1_manager_config.memory_config.numa_policy == "auto"
-        assert cfg_auto.l1_manager_config.memory_config.numa_headroom_bytes == 32 * GiB
-        assert l1_exposes_single_memory_region(cfg_auto) is False
+        cfg_on = parse_args_to_config(args_on)
+        assert cfg_on.l1_manager_config.memory_config.use_numa_sharding is True
+        assert l1_exposes_single_memory_region(cfg_on) is False
 
-        resolve_effective_l1_numa_policy(cfg_auto, p2p_enabled=True)
-        assert cfg_auto.l1_manager_config.memory_config.numa_policy == "disabled"
-        assert l1_exposes_single_memory_region(cfg_auto) is True
-
-        # Explicit --l1-numa-policy even + P2P -> ValueError.
-        args_even = parser.parse_args(
-            [
-                "--l1-size-gb",
-                "480",
-                "--eviction-policy",
-                "LRU",
-                "--l1-numa-policy",
-                "even",
-            ]
-        )
-        cfg_even = parse_args_to_config(args_even)
         with pytest.raises(ValueError, match="incompatible with: P2P"):
-            resolve_effective_l1_numa_policy(cfg_even, p2p_enabled=True)
-
-        # Explicit --l1-numa-policy nodes + engine_driven -> ValueError.
-        args_nodes = parser.parse_args(
-            [
-                "--l1-size-gb",
-                "480",
-                "--eviction-policy",
-                "LRU",
-                "--l1-numa-policy",
-                "nodes",
-                "--l1-numa-nodes",
-                "0,1,4,5",
-                "--l1-numa-headroom-gb",
-                "60",
-            ]
-        )
-        cfg_nodes = parse_args_to_config(args_nodes)
-        assert cfg_nodes.l1_manager_config.memory_config.numa_nodes == (0, 1, 4, 5)
-        assert cfg_nodes.l1_manager_config.memory_config.numa_headroom_bytes == 60 * GiB
+            validate_l1_numa_sharding_compatibility(cfg_on, p2p_enabled=True)
         with pytest.raises(ValueError, match="supported_transfer_mode"):
-            resolve_effective_l1_numa_policy(cfg_nodes, transfer_mode="engine_driven")
+            validate_l1_numa_sharding_compatibility(
+                cfg_on, transfer_mode="engine_driven"
+            )
 
-    # Environment variable opt-in works without CLI flag.
-    with (
-        patch("lmcache.v1.distributed.config.current_device_spec", fake_spec),
-        patch.dict(os.environ, {"LMCACHE_L1_NUMA_POLICY": "auto"}, clear=False),
-    ):
-        args_env = parser.parse_args(
-            ["--l1-size-gb", "480", "--eviction-policy", "LRU"]
-        )
-        cfg_env = parse_args_to_config(args_env)
-        assert cfg_env.l1_manager_config.memory_config.numa_policy == "auto"
-
-    # --gds-l1-path: 'auto' downgrades to 'disabled'; explicit 'even' raises ValueError.
-    with (
-        patch("lmcache.v1.distributed.config.current_device_spec", fake_spec),
-        patch.dict(os.environ, {}, clear=False),
-    ):
-        os.environ.pop("LMCACHE_L1_NUMA_POLICY", None)
-        args_gds_auto = parser.parse_args(
+        # --gds-l1-path + --l1-numa-sharding raises ValueError.
+        args_gds = parser.parse_args(
             [
                 "--l1-size-gb",
                 "64",
@@ -690,47 +599,62 @@ def test_opt_in_default_disabled_cli_env_and_compatibility_resolution():
                 "LRU",
                 "--gds-l1-path",
                 "/tmp/gds_slab",
-                "--l1-numa-policy",
-                "auto",
-            ]
-        )
-        cfg_gds_auto = parse_args_to_config(args_gds_auto)
-        assert cfg_gds_auto.l1_manager_config.memory_config.numa_policy == "disabled"
-
-        args_gds_even = parser.parse_args(
-            [
-                "--l1-size-gb",
-                "64",
-                "--eviction-policy",
-                "LRU",
-                "--gds-l1-path",
-                "/tmp/gds_slab",
-                "--l1-numa-policy",
-                "even",
+                "--l1-numa-sharding",
             ]
         )
         with pytest.raises(ValueError, match="GDS L1"):
-            parse_args_to_config(args_gds_even)
+            parse_args_to_config(args_gds)
 
-        # --l1-manager JSON rejects mixing with --l1-numa-* CLI flags or explicit env policy.
+        # --no-l1-use-lazy + --l1-numa-sharding raises ValueError.
+        args_nolazy = parser.parse_args(
+            [
+                "--l1-size-gb",
+                "64",
+                "--eviction-policy",
+                "LRU",
+                "--no-l1-use-lazy",
+                "--l1-numa-sharding",
+            ]
+        )
+        with pytest.raises(ValueError, match="requires --l1-use-lazy"):
+            parse_args_to_config(args_nolazy)
+
+        # --l1-manager JSON rejects mixing with --l1-numa-sharding CLI or env var.
         l1_json = (
             '{"type": "DRAM", "tag": "main", "size_gb": 16, '
             '"eviction": {"eviction_policy": "LRU"}}'
         )
         args_mgr_cli = parser.parse_args(
-            ["--l1-manager", l1_json, "--l1-numa-policy", "auto"]
+            ["--l1-manager", l1_json, "--l1-numa-sharding"]
         )
         with pytest.raises(ValueError, match="Use either --l1-manager or legacy L1 flags"):
             parse_args_to_config(args_mgr_cli)
 
         args_mgr_only = parser.parse_args(["--l1-manager", l1_json])
-        with patch.dict(os.environ, {"LMCACHE_L1_NUMA_POLICY": "auto"}, clear=False):
-            cfg_mgr_auto = parse_args_to_config(args_mgr_only)
-            assert cfg_mgr_auto.l1_manager_config.memory_config.numa_policy == "disabled"
-
-        with patch.dict(os.environ, {"LMCACHE_L1_NUMA_POLICY": "even"}, clear=False):
+        with patch.dict(os.environ, {"LMCACHE_L1_NUMA_SHARDING": "1"}, clear=False):
             with pytest.raises(ValueError, match="not supported with --l1-manager JSON"):
                 parse_args_to_config(args_mgr_only)
+
+    # Environment variable opt-in works without CLI flag, and --no-l1-numa-sharding overrides it.
+    with (
+        patch("lmcache.v1.distributed.config.current_device_spec", fake_spec),
+        patch.dict(os.environ, {"LMCACHE_L1_NUMA_SHARDING": "true"}, clear=False),
+    ):
+        args_env = parser.parse_args(
+            ["--l1-size-gb", "480", "--eviction-policy", "LRU"]
+        )
+        assert (
+            parse_args_to_config(args_env).l1_manager_config.memory_config.use_numa_sharding
+            is True
+        )
+        args_override = parser.parse_args(
+            ["--l1-size-gb", "480", "--eviction-policy", "LRU", "--no-l1-numa-sharding"]
+        )
+        assert (
+            parse_args_to_config(args_override)
+            .l1_manager_config.memory_config.use_numa_sharding
+            is False
+        )
 
 
 # ---------------------------------------------------------------------------

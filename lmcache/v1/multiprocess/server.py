@@ -24,7 +24,7 @@ from lmcache.v1.distributed.config import (
     StorageManagerConfig,
     add_storage_manager_args,
     parse_args_to_config,
-    resolve_effective_l1_numa_policy,
+    validate_l1_numa_sharding_compatibility,
 )
 from lmcache.v1.distributed.storage_manager import StorageManager
 from lmcache.v1.mp_observability.config import (
@@ -433,7 +433,7 @@ def run_cache_server(
         event_bus, obs_config, storage_manager_config, instance_id=mp_config.instance_id
     )
 
-    resolve_effective_l1_numa_policy(
+    validate_l1_numa_sharding_compatibility(
         storage_manager_config,
         p2p_enabled=mp_config.p2p_config.enabled,
         transfer_mode=mp_config.supported_transfer_mode,
