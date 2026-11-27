@@ -127,7 +127,14 @@ def _parse_l1_common(
         ):
             raise ValueError(f"{name} must be between zero and one")
     return cls(
-        L1MemoryManagerConfig(size, False, align_bytes=align, shm_name=""),
+        L1MemoryManagerConfig(
+            size,
+            False,
+            align_bytes=align,
+            shm_name="",
+            numa_policy="disabled",
+            numa_nodes=None,
+        ),
         tag=tag,
         eviction=eviction,
         read_ttl_seconds=read_ttl,
@@ -819,19 +826,19 @@ def resolve_effective_l1_numa_policy(
             reasons.append(f"supported_transfer_mode={transfer_mode!r}")
 
     for tag, l1_cfg in by_tag.items():
-        if l1_cfg.gds_l1_config is not None:
-            continue
         mem_cfg = l1_cfg.memory_config
         if mem_cfg.numa_policy == "disabled":
             continue
-        reasons = single_region_reasons[tag]
+        reasons = list(single_region_reasons[tag])
+        if l1_cfg.gds_l1_config is not None:
+            reasons.append("GDS L1 (--gds-l1-path)")
         if not reasons:
             continue
         joined = ", ".join(reasons)
         if mem_cfg.numa_policy == "auto":
             logger.info(
                 "Downgrading L1[%s] numa_policy from 'auto' to 'disabled' "
-                "(single contiguous L1 pool required by: %s)",
+                "(incompatible or single contiguous L1 pool required by: %s)",
                 tag,
                 joined,
             )
@@ -1013,7 +1020,9 @@ def add_storage_manager_args(
             "'disabled' (default, single contiguous pool), "
             "'auto' (headroom-aware sharding across accessible NUMA nodes), "
             "'even' (equal split across accessible NUMA nodes), or "
-            "'nodes' (shard across --l1-numa-nodes). Env: LMCACHE_L1_NUMA_POLICY."
+            "'nodes' (shard across --l1-numa-nodes). When enabled, pins the "
+            "full --l1-size-gb eagerly across shards (--l1-init-size-gb is "
+            "not used). Env: LMCACHE_L1_NUMA_POLICY."
         ),
     )
     memory_group.add_argument(
@@ -1211,8 +1220,23 @@ def parse_args_to_config(
             args.l1_size_gb is not None
             or args.gds_l1_path is not None
             or args.l1_devdax_path is not None
+            or getattr(args, "l1_numa_policy", None) is not None
+            or getattr(args, "l1_numa_nodes", None) is not None
+            or getattr(args, "l1_numa_headroom_gb", None) is not None
         ):
             raise ValueError("Use either --l1-manager or legacy L1 flags")
+        env_numa_policy = _default_l1_numa_policy()
+        if env_numa_policy == "auto":
+            logger.info(
+                "Ignoring LMCACHE_L1_NUMA_POLICY='auto' because --l1-manager "
+                "JSON does not configure L1 NUMA sharding."
+            )
+        elif env_numa_policy != "disabled":
+            raise ValueError(
+                f"LMCACHE_L1_NUMA_POLICY={env_numa_policy!r} is not supported "
+                "with --l1-manager JSON; use legacy --l1-size-gb flags or "
+                "set LMCACHE_L1_NUMA_POLICY=disabled."
+            )
         classes: dict[
             str,
             type[DRAML1ManagerConfig]

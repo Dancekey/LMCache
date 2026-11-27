@@ -52,6 +52,43 @@ class _AllocatedShard:
     allocator: TensorMemoryAllocator
 
 
+_UNRELEASED_INIT_LOCK = threading.Lock()
+_UNRELEASED_INIT_SHARDS: list[tuple[_PinnedAllocation, Callable[[int], Any]]] = []
+
+
+def retry_unreleased_init_shards() -> int:
+    """Retry releasing pinned shards stranded by a constructor rollback failure.
+
+    Returns:
+        Number of shards that still remain unreleased after this retry pass.
+    """
+    with _UNRELEASED_INIT_LOCK:
+        pending = list(_UNRELEASED_INIT_SHARDS)
+        _UNRELEASED_INIT_SHARDS.clear()
+
+    still_unreleased: list[tuple[_PinnedAllocation, Callable[[int], Any]]] = []
+    for allocation, free_fn in pending:
+        if allocation.released:
+            continue
+        try:
+            _safe_free_pinned_shard(allocation, free_fn)
+        except Exception:
+            logger.error(
+                "Retry free_pinned_ptr failed for stranded init shard %d "
+                "(node %d, ptr=0x%x)",
+                allocation.shard_idx,
+                allocation.numa_node,
+                allocation.ptr,
+                exc_info=True,
+            )
+        if not allocation.released:
+            still_unreleased.append((allocation, free_fn))
+
+    with _UNRELEASED_INIT_LOCK:
+        _UNRELEASED_INIT_SHARDS.extend(still_unreleased)
+        return len(_UNRELEASED_INIT_SHARDS)
+
+
 def _npu_is_available() -> bool:
     npu_mod = getattr(torch, "npu", None)
     if npu_mod is None:
@@ -252,6 +289,12 @@ class NumaShardedPinnedAllocator(LazyMemoryAllocator):
                         owner_ctx=owner_ctx,
                     )
                     acquired.append(allocation)
+                    if ptr % align_bytes != 0:
+                        raise RuntimeError(
+                            f"Pinned shard base 0x{ptr:x} on NUMA node {plan.node_id} "
+                            f"is not aligned to align_bytes={align_bytes} "
+                            f"(remainder {ptr % align_bytes})"
+                        )
                     arr_type = ctypes.c_uint8 * plan.size_bytes
                     buf = torch.frombuffer(arr_type.from_address(ptr), dtype=torch.uint8)
                     sub_alloc = TensorMemoryAllocator(
@@ -281,7 +324,7 @@ class NumaShardedPinnedAllocator(LazyMemoryAllocator):
                 if orig_affinity is not None and affinity_setter is not None:
                     affinity_setter(orig_affinity)
             memfree_after = memfree_reader(all_node_ids)
-        except BaseException:
+        except BaseException as init_exc:
             logger.error(
                 "L1 NUMA shard allocation failed after %d/%d shards; "
                 "rolling back allocated shards in reverse order.",
@@ -299,6 +342,17 @@ class NumaShardedPinnedAllocator(LazyMemoryAllocator):
                         allocated.numa_node,
                         exc_info=True,
                     )
+            unreleased = [a for a in acquired if not a.released]
+            if unreleased:
+                setattr(init_exc, "_unreleased_numa_shards", tuple(unreleased))
+                with _UNRELEASED_INIT_LOCK:
+                    for stranded in unreleased:
+                        _UNRELEASED_INIT_SHARDS.append((stranded, self._free_fn))
+                logger.error(
+                    "Quarantined %d unreleased NUMA shard(s) after rollback failure; "
+                    "call retry_unreleased_init_shards() to retry cleanup.",
+                    len(unreleased),
+                )
             self._shards.clear()
             raise
         summary = ", ".join(

@@ -40,6 +40,7 @@ from lmcache.v1.memory_allocators.numa_sharded_pinned_allocator import (
     NumaShardedPinnedAllocator,
     _PinnedAllocation,
     _safe_free_pinned_shard,
+    retry_unreleased_init_shards,
 )
 from lmcache.v1.memory_management import MemoryFormat
 
@@ -50,8 +51,15 @@ MiB = 1 << 20
 class _FakePinnedPool:
     """In-process ctypes backing store mimicking alloc_pinned_ptr/free_pinned_ptr."""
 
-    def __init__(self, fail_on_call: int | None = None) -> None:
+    _BASE_ALIGN = 65536
+
+    def __init__(
+        self,
+        fail_on_call: int | None = None,
+        misalign_by: int = 0,
+    ) -> None:
         self._fail_on_call = fail_on_call
+        self._misalign_by = misalign_by
         self._call_count = 0
         self._buffers: dict[int, ctypes.Array] = {}
         self.allocated_ptrs: list[int] = []
@@ -61,8 +69,11 @@ class _FakePinnedPool:
         self._call_count += 1
         if self._fail_on_call is not None and self._call_count == self._fail_on_call:
             raise RuntimeError("pinned host allocation failed")
-        buf = (ctypes.c_uint8 * size)()
-        ptr = ctypes.addressof(buf)
+        pad = self._BASE_ALIGN + abs(self._misalign_by)
+        buf = (ctypes.c_uint8 * (size + pad))()
+        raw_ptr = ctypes.addressof(buf)
+        aligned_ptr = (raw_ptr + (self._BASE_ALIGN - 1)) & ~(self._BASE_ALIGN - 1)
+        ptr = aligned_ptr + self._misalign_by
         self._buffers[ptr] = buf
         self.allocated_ptrs.append(ptr)
         return ptr
@@ -282,6 +293,7 @@ def test_sharded_allocator_cross_shard_batch_data_integrity_and_oom_rollback():
             base = pool.allocated_ptrs[s_idx]
             size = alloc.shard_plans[s_idx].size_bytes
             assert base <= obj.data_ptr
+            assert obj.data_ptr % 4096 == 0
             assert obj.data_ptr + obj.get_size() <= base + size
             obj.tensor.fill_(idx + 1)
 
@@ -398,6 +410,61 @@ def test_close_retries_only_unreleased_shards():
     allocator.close()
     allocator.close()
     assert attempts == [second, first, second]
+
+
+def test_misaligned_shard_base_pointer_fails_fast_and_rolls_back():
+    pool = _FakePinnedPool(misalign_by=64)
+    with pytest.raises(RuntimeError, match="not aligned to align_bytes=4096"):
+        NumaShardedPinnedAllocator(
+            size_in_bytes=4 * MiB,
+            align_bytes=4096,
+            numa_policy="even",
+            topo_nodes=_make_nodes(2),
+            alloc_fn=pool.alloc,
+            free_fn=pool.free,
+            memfree_reader=lambda ids: dict.fromkeys(ids, GiB),
+            affinity_getter=lambda: frozenset(),
+            affinity_setter=lambda _cpus: None,
+        )
+    assert len(pool.allocated_ptrs) == 1
+    assert pool.freed_ptrs == pool.allocated_ptrs
+
+
+def test_init_rollback_double_fault_quarantines_and_retries_unreleased_shards():
+    retry_unreleased_init_shards()
+    pool = _FakePinnedPool(fail_on_call=3)
+    fail_free_once = {"armed": True}
+
+    def flaky_free(ptr: int) -> None:
+        if fail_free_once["armed"] and ptr == pool.allocated_ptrs[0]:
+            fail_free_once["armed"] = False
+            raise RuntimeError("rollback free failed on shard 0")
+        pool.free(ptr)
+
+    with pytest.raises(RuntimeError, match="pinned host allocation failed") as exc_info:
+        NumaShardedPinnedAllocator(
+            size_in_bytes=16 * MiB,
+            align_bytes=4096,
+            numa_policy="even",
+            topo_nodes=_make_nodes(4),
+            alloc_fn=pool.alloc,
+            free_fn=flaky_free,
+            memfree_reader=lambda ids: dict.fromkeys(ids, 128 * GiB),
+            affinity_getter=lambda: frozenset(range(16)),
+            affinity_setter=lambda _cpus: None,
+        )
+
+    stranded = getattr(exc_info.value, "_unreleased_numa_shards", ())
+    assert len(stranded) == 1
+    assert stranded[0].ptr == pool.allocated_ptrs[0]
+    assert stranded[0].released is False
+    # Shard 1 freed during reverse rollback; shard 0 remained quarantined.
+    assert pool.freed_ptrs == [pool.allocated_ptrs[1]]
+
+    remaining = retry_unreleased_init_shards()
+    assert remaining == 0
+    assert stranded[0].released is True
+    assert pool.freed_ptrs == [pool.allocated_ptrs[1], pool.allocated_ptrs[0]]
 
 
 # ---------------------------------------------------------------------------
@@ -608,6 +675,62 @@ def test_opt_in_default_disabled_cli_env_and_compatibility_resolution():
         )
         cfg_env = parse_args_to_config(args_env)
         assert cfg_env.l1_manager_config.memory_config.numa_policy == "auto"
+
+    # --gds-l1-path: 'auto' downgrades to 'disabled'; explicit 'even' raises ValueError.
+    with (
+        patch("lmcache.v1.distributed.config.current_device_spec", fake_spec),
+        patch.dict(os.environ, {}, clear=False),
+    ):
+        os.environ.pop("LMCACHE_L1_NUMA_POLICY", None)
+        args_gds_auto = parser.parse_args(
+            [
+                "--l1-size-gb",
+                "64",
+                "--eviction-policy",
+                "LRU",
+                "--gds-l1-path",
+                "/tmp/gds_slab",
+                "--l1-numa-policy",
+                "auto",
+            ]
+        )
+        cfg_gds_auto = parse_args_to_config(args_gds_auto)
+        assert cfg_gds_auto.l1_manager_config.memory_config.numa_policy == "disabled"
+
+        args_gds_even = parser.parse_args(
+            [
+                "--l1-size-gb",
+                "64",
+                "--eviction-policy",
+                "LRU",
+                "--gds-l1-path",
+                "/tmp/gds_slab",
+                "--l1-numa-policy",
+                "even",
+            ]
+        )
+        with pytest.raises(ValueError, match="GDS L1"):
+            parse_args_to_config(args_gds_even)
+
+        # --l1-manager JSON rejects mixing with --l1-numa-* CLI flags or explicit env policy.
+        l1_json = (
+            '{"type": "DRAM", "tag": "main", "size_gb": 16, '
+            '"eviction": {"eviction_policy": "LRU"}}'
+        )
+        args_mgr_cli = parser.parse_args(
+            ["--l1-manager", l1_json, "--l1-numa-policy", "auto"]
+        )
+        with pytest.raises(ValueError, match="Use either --l1-manager or legacy L1 flags"):
+            parse_args_to_config(args_mgr_cli)
+
+        args_mgr_only = parser.parse_args(["--l1-manager", l1_json])
+        with patch.dict(os.environ, {"LMCACHE_L1_NUMA_POLICY": "auto"}, clear=False):
+            cfg_mgr_auto = parse_args_to_config(args_mgr_only)
+            assert cfg_mgr_auto.l1_manager_config.memory_config.numa_policy == "disabled"
+
+        with patch.dict(os.environ, {"LMCACHE_L1_NUMA_POLICY": "even"}, clear=False):
+            with pytest.raises(ValueError, match="not supported with --l1-manager JSON"):
+                parse_args_to_config(args_mgr_only)
 
 
 # ---------------------------------------------------------------------------
