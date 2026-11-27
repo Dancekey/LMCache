@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Standard
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from typing import TYPE_CHECKING, Any
 import math
 import sys
@@ -828,6 +828,22 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
     @property
     def role(self) -> KVConnectorRole:
         return self._role
+
+    def set_xfer_handshake_metadata_pp_aware(
+        self, metadata: Mapping[Any, Any]
+    ) -> None:
+        """Accept peer PP handshake metadata as a local-cache no-op.
+
+        LMCache MP manages its own cache registration over IPC/RPC rather than
+        peer P/D handshakes. Under MultiConnector with PP > 1, vLLM forwards
+        sibling connector metadata (e.g. Mooncake/NIXL) to all child connectors;
+        ignoring it here avoids the base class PP rejection and leaves the
+        payload untouched for sibling connectors.
+
+        Args:
+            metadata: Peer connector handshake metadata, intentionally untouched.
+        """
+        return None
 
     @property
     def transfer_intermediate_tensors(self) -> bool:
@@ -1696,6 +1712,13 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
 
         for new_request in scheduler_output.scheduled_new_reqs:
             request_tracker = self._get_request_tracker(new_request.req_id)
+
+            # MultiConnector may pass empty blocks to a non-selected loader,
+            # but a writer still needs the scheduler's allocated block ids.
+            if not request_tracker.allocated_block_ids and new_request.block_ids:
+                request_tracker.append_block_ids(
+                    new_request.block_ids, self._mamba_relocation_window
+                )
 
             num_new_tokens = scheduler_output.num_scheduled_tokens[new_request.req_id]
             request_tracker.increase_num_scheduled_tokens(num_new_tokens)
