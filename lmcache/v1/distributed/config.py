@@ -281,6 +281,57 @@ def _infer_l1_devdax_overflow_from_dax_adapter(
     l2_adapter_config.adapters = remaining_adapters
 
 
+L1NumaPolicy = Literal["disabled", "auto", "even", "nodes"]
+_VALID_L1_NUMA_POLICIES: tuple[str, ...] = ("disabled", "auto", "even", "nodes")
+
+
+def _parse_numa_nodes_str(raw: str | None) -> tuple[int, ...] | None:
+    """Parse a comma-separated NUMA node list such as ``'0,1,2,3'``."""
+    if raw is None:
+        return None
+    text = raw.strip()
+    if not text:
+        return None
+    nodes: list[int] = []
+    for part in text.split(","):
+        token = part.strip()
+        if not token:
+            continue
+        node = int(token)
+        if node < 0:
+            raise ValueError(f"NUMA node id must be non-negative, got {node}")
+        if node not in nodes:
+            nodes.append(node)
+    return tuple(nodes) if nodes else None
+
+
+def _default_l1_numa_policy() -> L1NumaPolicy:
+    """Opt-in NUMA sharding policy; defaults to ``'disabled'`` unless configured."""
+    env_val = os.environ.get("LMCACHE_L1_NUMA_POLICY", "").strip().lower()
+    if env_val:
+        if env_val not in _VALID_L1_NUMA_POLICIES:
+            raise ValueError(
+                f"Invalid LMCACHE_L1_NUMA_POLICY={env_val!r}; "
+                f"expected one of: {', '.join(_VALID_L1_NUMA_POLICIES)}"
+            )
+        return cast(L1NumaPolicy, env_val)
+    return "disabled"
+
+
+def _default_l1_numa_nodes() -> tuple[int, ...] | None:
+    return _parse_numa_nodes_str(os.environ.get("LMCACHE_L1_NUMA_NODES"))
+
+
+def _default_l1_numa_headroom_bytes() -> int:
+    raw = os.environ.get("LMCACHE_L1_NUMA_HEADROOM_GB", "").strip()
+    gb = float(raw) if raw else 32.0
+    if not math.isfinite(gb) or gb < 0:
+        raise ValueError(
+            "LMCACHE_L1_NUMA_HEADROOM_GB must be a finite non-negative number"
+        )
+    return int(gb * (1 << 30))
+
+
 @dataclass
 class L1MemoryManagerConfig:
     """
@@ -310,6 +361,15 @@ class L1MemoryManagerConfig:
 
     devdax_size_in_bytes: int = 0
     """ Optional Device-DAX overflow size for hybrid DRAM + DAX L1. """
+
+    numa_policy: L1NumaPolicy = field(default_factory=_default_l1_numa_policy)
+    """ Opt-in per-NUMA sharding policy for pinned DRAM L1 ('disabled', 'auto', 'even', 'nodes'). """
+
+    numa_nodes: tuple[int, ...] | None = field(default_factory=_default_l1_numa_nodes)
+    """ Explicit NUMA node IDs used when ``numa_policy='nodes'``. """
+
+    numa_headroom_bytes: int = field(default_factory=_default_l1_numa_headroom_bytes)
+    """ Per-NUMA MemFree headroom (bytes) reserved for co-located workloads under 'auto'/'nodes'. """
 
     def __post_init__(self):
         self.init_size_in_bytes = min(self.init_size_in_bytes, self.size_in_bytes)
@@ -351,6 +411,41 @@ class L1MemoryManagerConfig:
                 "supported on the current backend. Disabling l1-use-lazy."
             )
             self.use_lazy = False
+
+        if self.numa_policy not in _VALID_L1_NUMA_POLICIES:
+            raise ValueError(
+                f"Invalid numa_policy={self.numa_policy!r}; "
+                f"expected one of: {', '.join(_VALID_L1_NUMA_POLICIES)}"
+            )
+        if self.numa_headroom_bytes < 0:
+            raise ValueError("numa_headroom_bytes must be >= 0")
+        if self.numa_nodes is not None:
+            normalized_nodes: list[int] = []
+            for nid in self.numa_nodes:
+                if isinstance(nid, bool) or not isinstance(nid, int) or nid < 0:
+                    raise ValueError(
+                        f"numa_nodes entries must be non-negative ints, got {nid!r}"
+                    )
+                if nid not in normalized_nodes:
+                    normalized_nodes.append(nid)
+            self.numa_nodes = tuple(normalized_nodes) if normalized_nodes else None
+        if self.numa_policy == "nodes" and not self.numa_nodes:
+            raise ValueError(
+                "--l1-numa-policy=nodes requires non-empty --l1-numa-nodes "
+                "(e.g. --l1-numa-nodes 0,1,2,3,4,5,6,7)"
+            )
+        if not self.use_lazy and self.numa_policy != "disabled":
+            if self.numa_policy == "auto":
+                logger.info(
+                    "Disabling L1 NUMA sharding (auto -> disabled) because "
+                    "use_lazy is False."
+                )
+                self.numa_policy = "disabled"
+            else:
+                raise ValueError(
+                    f"--l1-numa-policy={self.numa_policy!r} requires --l1-use-lazy "
+                    "(pinned DRAM L1 without hugepages or Device-DAX)."
+                )
 
 
 @dataclass
@@ -691,6 +786,62 @@ def normalize_storage_manager_config(config: StorageManagerConfig) -> None:
             config.l2_adapter_config,
             config.l1_manager_config.tag,
         )
+    resolve_effective_l1_numa_policy(config)
+
+
+def resolve_effective_l1_numa_policy(
+    config: StorageManagerConfig,
+    *,
+    p2p_enabled: bool = False,
+    transfer_mode: str = "lmcache_driven",
+) -> None:
+    """Resolve L1 NUMA sharding policy against L2, P2P, and transfer-mode constraints.
+
+    In ``auto`` mode, any requirement for a single contiguous L1 memory region
+    automatically downgrades ``numa_policy`` to ``disabled`` with an INFO log.
+    Explicit ``even`` or ``nodes`` modes raise ``ValueError`` on conflict.
+    """
+    by_tag = {c.tag: c for c in config.l1_manager_configs}
+    single_region_reasons: dict[str, list[str]] = {tag: [] for tag in by_tag}
+
+    for adapter_config in config.l2_adapter_config.adapters:
+        adapter_name = requires_single_l1_memory_region(adapter_config)
+        if adapter_name and adapter_config.affinity_tag in single_region_reasons:
+            single_region_reasons[adapter_config.affinity_tag].append(
+                f"L2 adapter {adapter_name!r}"
+            )
+
+    if p2p_enabled:
+        for reasons in single_region_reasons.values():
+            reasons.append("P2P (--p2p-advertise-url)")
+    if transfer_mode != "lmcache_driven":
+        for reasons in single_region_reasons.values():
+            reasons.append(f"supported_transfer_mode={transfer_mode!r}")
+
+    for tag, l1_cfg in by_tag.items():
+        if l1_cfg.gds_l1_config is not None:
+            continue
+        mem_cfg = l1_cfg.memory_config
+        if mem_cfg.numa_policy == "disabled":
+            continue
+        reasons = single_region_reasons[tag]
+        if not reasons:
+            continue
+        joined = ", ".join(reasons)
+        if mem_cfg.numa_policy == "auto":
+            logger.info(
+                "Downgrading L1[%s] numa_policy from 'auto' to 'disabled' "
+                "(single contiguous L1 pool required by: %s)",
+                tag,
+                joined,
+            )
+            mem_cfg.numa_policy = "disabled"
+        else:
+            raise ValueError(
+                f"--l1-numa-policy={mem_cfg.numa_policy!r} splits L1 across "
+                f"multiple pinned buffers and is incompatible with: {joined}. "
+                "Use --l1-numa-policy=disabled or auto."
+            )
 
 
 def validate_storage_manager_config(config: StorageManagerConfig) -> None:
@@ -755,6 +906,8 @@ def l1_exposes_single_memory_region(config: StorageManagerConfig) -> bool:
     if l1_config.gds_l1_config is not None:
         return False
     if l1_config.memory_config.devdax_path:
+        return False
+    if l1_config.memory_config.numa_policy != "disabled":
         return False
     return True
 
@@ -848,6 +1001,38 @@ def add_storage_manager_args(
             'map. Set --no-l1-use-lazy and --shm-name "". '
             "If a DAX L2 adapter with the same device_path is registered, "
             "that adapter's max_dax_size_gb is used as L1 overflow size."
+        ),
+    )
+    memory_group.add_argument(
+        "--l1-numa-policy",
+        type=str,
+        choices=_VALID_L1_NUMA_POLICIES,
+        default=None,
+        help=(
+            "Opt-in NUMA sharding policy for pinned DRAM L1: "
+            "'disabled' (default, single contiguous pool), "
+            "'auto' (headroom-aware sharding across accessible NUMA nodes), "
+            "'even' (equal split across accessible NUMA nodes), or "
+            "'nodes' (shard across --l1-numa-nodes). Env: LMCACHE_L1_NUMA_POLICY."
+        ),
+    )
+    memory_group.add_argument(
+        "--l1-numa-nodes",
+        type=str,
+        default=None,
+        help=(
+            "Comma-separated NUMA node IDs for --l1-numa-policy=nodes "
+            "(e.g. '0,1,2,3,4,5,6,7'). Env: LMCACHE_L1_NUMA_NODES."
+        ),
+    )
+    memory_group.add_argument(
+        "--l1-numa-headroom-gb",
+        type=float,
+        default=None,
+        help=(
+            "Per-NUMA MemFree headroom (GiB) preserved for co-located "
+            "pinned-memory workloads under --l1-numa-policy=auto/nodes. "
+            "Default is 32.0 GiB. Env: LMCACHE_L1_NUMA_HEADROOM_GB."
         ),
     )
 
@@ -1090,6 +1275,28 @@ def parse_args_to_config(
             logger.error("Hugepage availability check failed: %s", e)
             raise
 
+    raw_numa_policy = getattr(args, "l1_numa_policy", None)
+    numa_policy: L1NumaPolicy = (
+        cast(L1NumaPolicy, raw_numa_policy)
+        if raw_numa_policy is not None
+        else _default_l1_numa_policy()
+    )
+    raw_numa_nodes = getattr(args, "l1_numa_nodes", None)
+    numa_nodes = (
+        _parse_numa_nodes_str(raw_numa_nodes)
+        if raw_numa_nodes is not None
+        else _default_l1_numa_nodes()
+    )
+    raw_numa_headroom_gb = getattr(args, "l1_numa_headroom_gb", None)
+    if raw_numa_headroom_gb is not None:
+        if not math.isfinite(raw_numa_headroom_gb) or raw_numa_headroom_gb < 0:
+            raise ValueError(
+                "--l1-numa-headroom-gb must be a finite non-negative number"
+            )
+        numa_headroom_bytes = int(raw_numa_headroom_gb * (1 << 30))
+    else:
+        numa_headroom_bytes = _default_l1_numa_headroom_bytes()
+
     if shm_name is None:
         memory_config = L1MemoryManagerConfig(
             size_in_bytes=int(args.l1_size_gb * (1 << 30)),
@@ -1098,6 +1305,9 @@ def parse_args_to_config(
             align_bytes=args.l1_align_bytes,
             use_hugepages=use_hugepages,
             devdax_path=args.l1_devdax_path,
+            numa_policy=numa_policy,
+            numa_nodes=numa_nodes,
+            numa_headroom_bytes=numa_headroom_bytes,
         )
     else:
         memory_config = L1MemoryManagerConfig(
@@ -1108,6 +1318,9 @@ def parse_args_to_config(
             shm_name=shm_name,
             use_hugepages=use_hugepages,
             devdax_path=args.l1_devdax_path,
+            numa_policy=numa_policy,
+            numa_nodes=numa_nodes,
+            numa_headroom_bytes=numa_headroom_bytes,
         )
 
     gds_l1_config: GdsL1Config | None = None

@@ -19,6 +19,7 @@ from lmcache.v1.distributed.config import (
     add_storage_manager_args,
     l1_exposes_single_memory_region,
     parse_args_to_config,
+    resolve_effective_l1_numa_policy,
 )
 from lmcache.v1.mp_coordinator.cache_events import (
     maybe_create_cache_event_subscriber,
@@ -213,6 +214,11 @@ def run_http_server(
             with observability disabled (the cache-event stream rides the
             event bus).
     """
+    resolve_effective_l1_numa_policy(
+        storage_manager_config,
+        p2p_enabled=mp_config.p2p_config.enabled,
+        transfer_mode=mp_config.supported_transfer_mode,
+    )
     if mp_config.p2p_config.enabled:
         if not coordinator_config.url:
             raise ValueError(
